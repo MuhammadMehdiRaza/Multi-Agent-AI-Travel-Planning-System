@@ -34,3 +34,16 @@ class TravelState(TypedDict):
     hotel_results: str
     itinerary: str
     llm_calls: int
+
+# Flight Agent
+def flight_agent(state: TravelState):
+    query = state["user_query"]
+    flight_data = search_flights(query)
+    return {
+        "flight_results": flight_data,
+        "messages": [
+            AIMessage(content=f"Flight results fetched")
+        ],
+        # "llm_calls": state.get("llm_calls", 0) + 1
+    }
+

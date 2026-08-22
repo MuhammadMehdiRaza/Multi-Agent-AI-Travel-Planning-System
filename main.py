@@ -134,3 +134,32 @@ checkpointer=PostgresSaver(connection)
 checkpointer.setup()
 # LangGraph gets connected to the internal tables and now it can save/retrive data from those checkpoints
 app=graph.compile(checkpointer=checkpointer)
+
+
+if __name__ == "__main__":
+    config = {
+        "configurable": {
+            "thread_id": "user_mehdi"
+        }
+    }
+
+    user_input = input("Enter travel request: ")
+
+    result = app.invoke(
+        {
+            "messages": [
+                HumanMessage(content=user_input)
+            ],
+            "user_query": user_input,
+            "flight_results": "",
+            "hotel_results": "",
+            "itinerary": "",
+            "llm_calls": 0
+        },
+        config=config
+    )
+
+    print("\nFINAL RESPONSE:\n")
+
+    for msg in result["messages"]:
+        print(msg.content)

@@ -21,7 +21,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 llm=ChatGroq(
-    model="llama-3.3-70b-versatile"
+    model="openai/gpt-oss-120b",
+    groq_api_key=os.getenv("GROQ_API_KEY"),
+    max_tokens=4096,
+    temperature=0.3,
 )
 
 DATABASE_URL= os.getenv("DATABASE_URL")
@@ -127,7 +130,7 @@ graph.add_edge("Itenary Agent", "Final Agent")
 graph.add_edge("Final Agent", END)
 
 # Python <--> Postgress connection
-connection=psycopg.connect(DATABASE_URL)
+connection=psycopg.connect(DATABASE_URL,autocommit=True)
 #LangGraph <---> Postgres Connection 
 checkpointer=PostgresSaver(connection)
 # Create tables for checkpoints that LangGraph can use

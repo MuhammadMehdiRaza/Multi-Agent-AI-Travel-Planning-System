@@ -113,3 +113,24 @@ def final_agent(state: TravelState):
         "messages": [response],
         "llm_calls": state.get("llm_calls", 0) + 1
     }
+
+graph=StateGraph(TravelState)
+graph.add_node("Flight Agent", flight_agent)
+graph.add_node("Hotel Agent", hotel_agent)
+graph.add_node("Itenary Agent", itinerary_agent)
+graph.add_node("Final Agent", final_agent)
+
+graph.add_edge(START, "Flight Agent")
+graph.add_edge("Flight Agent", "Hotel Agent")
+graph.add_edge("Hotel Agent", "Itenary Agent")
+graph.add_edge("Itenary Agent", "Final Agent")
+graph.add_edge("Final Agent", END)
+
+# Python <--> Postgress connection
+connection=psycopg.connect(DATABASE_URL)
+#LangGraph <---> Postgres Connection 
+checkpointer=PostgresSaver(connection)
+# Create tables for checkpoints that LangGraph can use
+checkpointer.setup()
+# LangGraph gets connected to the internal tables and now it can save/retrive data from those checkpoints
+app=graph.compile(checkpointer=checkpointer)

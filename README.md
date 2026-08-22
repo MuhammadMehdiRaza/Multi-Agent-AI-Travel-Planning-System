@@ -1,6 +1,24 @@
-# Multi-Agent Travel Planning System
+# Multi-Agent AI Travel Planning System
 
-A stateful multi-agent system for travel planning built with LangGraph. Given a user query, the system coordinates between a flight lookup agent and a hotel/web search agent, then generates a complete travel itinerary using the Llama 3.3 70B model via Groq.
+A full-stack travel planning application powered by a multi-agent AI pipeline. The system coordinates four specialized agents — flight lookup, hotel search, itinerary generation, and final compilation — and presents results through a modern web interface built with React and TypeScript.
+
+---
+
+## How It Works
+
+```
+Browser (React + TypeScript)
+        ↓  POST /api/chat
+FastAPI Server (api.py)
+        ↓  app.invoke(...)
+LangGraph Agent Graph (main.py)
+   ├── Flight Agent   →  Aviationstack API
+   ├── Hotel Agent    →  Tavily Search API
+   ├── Itinerary Agent →  Groq LLM (llama / gpt-oss)
+   └── Final Agent    →  Groq LLM
+        ↓
+PostgreSQL  (conversation memory via PostgresSaver)
+```
 
 ---
 
@@ -9,10 +27,13 @@ A stateful multi-agent system for travel planning built with LangGraph. Given a 
 | Layer | Technology |
 |---|---|
 | Agent Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) |
-| LLM | ChatGroq — `llama-3.3-70b-versatile` |
+| LLM | ChatGroq — `openai/gpt-oss-120b` |
 | Flight Data | [Aviationstack API](https://aviationstack.com/) |
 | Web / Hotel Search | [Tavily Search API](https://tavily.com/) |
 | State Persistence | PostgreSQL via `PostgresSaver` |
+| Backend API | FastAPI + Uvicorn |
+| Frontend | React 19 + TypeScript (Vite) |
+| Icons | Lucide React |
 
 ---
 
@@ -20,12 +41,26 @@ A stateful multi-agent system for travel planning built with LangGraph. Given a 
 
 ```
 Multi Agent System Demo/
+├── frontend/                      # React + TypeScript UI
+│   ├── src/
+│   │   ├── api/
+│   │   │   └── travel.ts          # API helper — calls the FastAPI backend
+│   │   ├── components/
+│   │   │   ├── AgentStep.tsx      # Vertical stepper card per agent
+│   │   │   ├── ResultsPanel.tsx   # Pipeline view + final plan card
+│   │   │   └── SearchBar.tsx      # Session name + query form
+│   │   ├── App.tsx                # Root layout and state
+│   │   ├── index.css              # Design tokens + animations
+│   │   └── main.tsx               # React entry point
+│   ├── index.html
+│   └── package.json
 ├── tools/
-│   ├── flight_tool.py       # Fetches live flight data from Aviationstack
-│   └── tavily_tool.py       # Web and hotel search via Tavily
-├── main.py                  # LangGraph state graph and agent workflow
-├── requirements.txt         # Python dependencies
-├── .env                     # Environment variables (not committed)
+│   ├── flight_tool.py             # Aviationstack API client
+│   └── tavily_tool.py             # Tavily Search API client
+├── api.py                         # FastAPI server wrapping the LangGraph app
+├── main.py                        # Agent graph definition and state schema
+├── requirements.txt               # Python dependencies
+├── .env                           # Environment variables (not committed)
 ├── .gitignore
 ├── LICENSE
 └── README.md
@@ -35,14 +70,13 @@ Multi Agent System Demo/
 
 ## Prerequisites
 
-Before running this project, make sure you have the following:
-
 - Python 3.10 or higher
+- Node.js 18 or higher
 - A running PostgreSQL instance
 - API keys from:
-  - [Groq Cloud](https://console.groq.com/) — for LLM inference
-  - [Tavily](https://tavily.com/) — for web and hotel search
-  - [Aviationstack](https://aviationstack.com/) — for flight data
+  - [Groq Cloud](https://console.groq.com/)
+  - [Tavily](https://tavily.com/)
+  - [Aviationstack](https://aviationstack.com/)
 
 ---
 
@@ -51,17 +85,15 @@ Before running this project, make sure you have the following:
 **1. Clone the repository**
 
 ```bash
-git clone <repository-url>
-cd "Multi Agent System Demo"
+git clone https://github.com/MuhammadMehdiRaza/Multi-Agent-AI-Travel-Planning-System.git
+cd "Multi-Agent-AI-Travel-Planning-System"
 ```
 
-**2. Create a virtual environment**
+**2. Create and activate a Python virtual environment**
 
 ```bash
 python -m venv LangGraphenv
 ```
-
-Activate it:
 
 ```bash
 # Windows
@@ -71,15 +103,13 @@ LangGraphenv\Scripts\activate
 source LangGraphenv/bin/activate
 ```
 
-**3. Install dependencies**
+**3. Install Python dependencies**
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**4. Create a `.env` file**
-
-In the root directory, create a `.env` file with the following variables:
+**4. Create a `.env` file in the project root**
 
 ```env
 GROQ_API_KEY=your_groq_api_key
@@ -88,28 +118,56 @@ TAVILY_API_KEY=your_tavily_api_key
 DATABASE_URL=postgresql://username:password@localhost:5432/your_database
 ```
 
----
-
-## Running
+**5. Install frontend dependencies**
 
 ```bash
-python main.py
+cd frontend
+npm install
 ```
 
 ---
 
-## State Schema
+## Running the Application
 
-The agent graph passes a shared `TravelState` object through each node:
+You need two terminals running simultaneously.
+
+**Terminal 1 — Backend API** (from the project root, with venv active):
+
+```bash
+uvicorn api:server --reload --port 8000
+```
+
+**Terminal 2 — Frontend** (from the `frontend/` directory):
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+---
+
+## Using the App
+
+1. Enter a **session name** (e.g. your name). Using the same name on future visits lets the system remember your conversation history.
+2. Type a **travel request** — be as specific as you like (destination, dates, budget, preferences).
+3. Click **Plan trip** and watch the four agents work through the pipeline.
+4. The final itinerary appears in the **Your travel plan** section once all agents complete.
+
+---
+
+## Agent State Schema
+
+The LangGraph graph passes a shared `TravelState` object through each node:
 
 | Field | Type | Description |
 |---|---|---|
 | `messages` | `list[AnyMessage]` | Full conversation history |
 | `user_query` | `str` | The raw travel query from the user |
-| `flight_results` | `str` | Output from the flight lookup tool |
-| `hotel_results` | `str` | Output from the hotel/web search tool |
-| `itinerary` | `str` | Final generated travel itinerary |
-| `llm_calls` | `int` | Counter tracking the number of LLM calls made |
+| `flight_results` | `str` | Output from the flight lookup agent |
+| `hotel_results` | `str` | Output from the hotel search agent |
+| `itinerary` | `str` | Generated day-by-day itinerary |
+| `llm_calls` | `int` | Number of LLM calls made in this run |
 
 ---
 

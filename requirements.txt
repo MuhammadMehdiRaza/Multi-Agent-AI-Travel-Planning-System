@@ -6,3 +6,6 @@ psycopg[binary,pool]
 tavily-python
 requests
 python-dotenv
+fastapi
+uvicorn
+pydantic

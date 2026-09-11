@@ -1,19 +1,23 @@
 /**
  * App.tsx
- * Shell layout: dot-grid page, glassmorphism navbar, centred 680px column.
+ * Shell layout and the two-phase planning flow.
+ *
+ * Planning is two requests, not one, because the graph suspends at its human
+ * approval node. `handlePlan` starts the run and receives a draft;
+ * `handleApproval` resumes the same run on the same thread. The thread id is the
+ * only thing that links them, and it doubles as the memory key in PostgreSQL.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
-import { Plane } from "lucide-react";
+import { AlertTriangle, Plane } from "lucide-react";
 import SearchBar from "./components/SearchBar";
 import ResultsPanel from "./components/ResultsPanel";
-import { sendTravelQuery } from "./api/travel";
-import type { TravelResponse } from "./api/travel";
+import { createPlan, readHealth, submitApproval } from "./api/travel";
+import type { HealthResponse, PlanResponse } from "./api/travel";
 import "./index.css";
 
 const s: Record<string, CSSProperties> = {
-  /* Navbar */
   navbar: {
     position: "sticky",
     top: 0,
@@ -28,18 +32,14 @@ const s: Record<string, CSSProperties> = {
     padding: "0 24px",
   },
   navInner: {
-    maxWidth: "680px",
+    maxWidth: "760px",
     margin: "0 auto",
     width: "100%",
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
   },
-  navLogo: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-  },
+  navLogo: { display: "flex", alignItems: "center", gap: "8px" },
   navBadge: {
     display: "flex",
     alignItems: "center",
@@ -68,15 +68,9 @@ const s: Record<string, CSSProperties> = {
     letterSpacing: "0.01em",
   },
 
-  /* Main column */
-  main: {
-    maxWidth: "680px",
-    margin: "0 auto",
-    padding: "52px 24px 96px",
-  },
+  main: { maxWidth: "760px", margin: "0 auto", padding: "52px 24px 96px" },
 
-  /* Page heading */
-  heading: { marginBottom: "36px" },
+  heading: { marginBottom: "28px" },
   h1: {
     fontSize: "24px",
     fontWeight: 700,
@@ -85,35 +79,72 @@ const s: Record<string, CSSProperties> = {
     lineHeight: 1.25,
     marginBottom: "8px",
   },
-  sub: {
-    fontSize: "14px",
-    color: "var(--text-500)",
-    lineHeight: 1.7,
+  sub: { fontSize: "14px", color: "var(--text-500)", lineHeight: 1.7 },
+
+  warning: {
+    display: "flex",
+    gap: "10px",
+    alignItems: "flex-start",
+    backgroundColor: "var(--amber-50)",
+    border: "1px solid #fde68a",
+    borderRadius: "var(--r-md)",
+    padding: "12px 14px",
+    marginBottom: "24px",
+    fontSize: "13px",
+    color: "var(--text-700)",
+    lineHeight: 1.65,
   },
 };
 
 export default function App() {
-  const [query, setQuery]           = useState("");
-  const [sessionId, setSessionId]   = useState("");
-  const [result, setResult]         = useState<TravelResponse | null>(null);
-  const [isLoading, setIsLoading]   = useState(false);
-  const [error, setError]           = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [threadId, setThreadId] = useState("");
 
-  async function handleSubmit() {
-    setResult(null); setError(null); setIsLoading(true);
+  const [result, setResult] = useState<PlanResponse | null>(null);
+  const [isPlanning, setIsPlanning] = useState(false);
+  const [isApproving, setIsApproving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+
+  // Surface a half-configured backend up front rather than letting it show up
+  // as an empty weather section halfway through a run.
+  useEffect(() => {
+    readHealth()
+      .then(setHealth)
+      .catch(() => setHealth(null));
+  }, []);
+
+  async function handlePlan() {
+    setResult(null);
+    setError(null);
+    setIsPlanning(true);
+
     try {
-      setResult(await sendTravelQuery(query, sessionId));
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "An unexpected error occurred.");
+      setResult(await createPlan(query, threadId));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Something went wrong.");
     } finally {
-      setIsLoading(false);
+      setIsPlanning(false);
     }
   }
 
+  async function handleApproval(approved: boolean, feedback: string) {
+    setError(null);
+    setIsApproving(true);
+
+    try {
+      setResult(await submitApproval(threadId, approved, feedback));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not submit your review.");
+    } finally {
+      setIsApproving(false);
+    }
+  }
+
+  const unavailable = Object.entries(health?.mcp_servers_unavailable ?? {});
+
   return (
     <div className="dot-grid" style={{ minHeight: "100vh" }}>
-
-      {/* Navbar */}
       <header style={s.navbar}>
         <div style={s.navInner}>
           <div style={s.navLogo}>
@@ -122,7 +153,9 @@ export default function App() {
             </div>
             <span style={s.navBrand}>Travel Planner</span>
           </div>
-          <span style={s.navPill}>Multi-Agent AI</span>
+          <span style={s.navPill}>
+            {health ? `Supervisor · MCP · HITL · ${health.model}` : "Supervisor · MCP · HITL"}
+          </span>
         </div>
       </header>
 
@@ -130,18 +163,45 @@ export default function App() {
         <div style={s.heading}>
           <h1 style={s.h1}>Plan your next trip</h1>
           <p style={s.sub}>
-            Describe where you want to go. Our AI agents will search for flights,
-            find hotels, and build a full itinerary automatically.
+            Describe the trip you want. A supervisor agent decides which specialists to
+            run, they gather live data through MCP servers, and you review the draft plan
+            before it is finalised.
           </p>
         </div>
 
+        {unavailable.length > 0 && (
+          <div style={s.warning}>
+            <AlertTriangle size={16} color="var(--amber-600)" style={{ flexShrink: 0, marginTop: "1px" }} />
+            <div>
+              <strong>Some MCP servers are not configured.</strong> Those sections of the
+              plan will be marked unavailable instead of failing the run.
+              <ul style={{ margin: "6px 0 0 18px" }}>
+                {unavailable.map(([name, reason]) => (
+                  <li key={name}>
+                    <code>{name}</code> — {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
         <SearchBar
-          query={query} sessionId={sessionId} isLoading={isLoading}
-          onQueryChange={setQuery} onSessionIdChange={setSessionId}
-          onSubmit={handleSubmit}
+          query={query}
+          sessionId={threadId}
+          isLoading={isPlanning || isApproving}
+          onQueryChange={setQuery}
+          onSessionIdChange={setThreadId}
+          onSubmit={handlePlan}
         />
 
-        <ResultsPanel isLoading={isLoading} result={result} error={error} />
+        <ResultsPanel
+          isPlanning={isPlanning}
+          isApproving={isApproving}
+          result={result}
+          error={error}
+          onApproval={handleApproval}
+        />
       </main>
     </div>
   );

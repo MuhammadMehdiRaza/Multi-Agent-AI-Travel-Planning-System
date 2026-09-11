@@ -160,7 +160,7 @@ const s: Record<string, CSSProperties> = {
   },
 };
 
-const STEPS = ["Flight search", "Hotel search", "Itinerary", "Final plan"];
+const STEPS = ["Guardrail", "Supervisor", "Specialists", "Your review"];
 
 export default function SearchBar({
   query, sessionId, isLoading,
@@ -191,7 +191,9 @@ export default function SearchBar({
               required
             />
           </div>
-          <span style={s.hint}>Reuse the same name to continue a conversation.</span>
+          <span style={s.hint}>
+            Also the thread id. Reuse it to continue an earlier conversation.
+          </span>
         </div>
 
         {/* Travel Request */}
@@ -235,7 +237,7 @@ export default function SearchBar({
           {isLoading
             ? <Loader2 size={14} style={s.spinner} />
             : null}
-          {isLoading ? "Planning…" : "Plan trip"}
+          {isLoading ? "Planning…" : "Create draft plan"}
         </button>
       </div>
     </form>

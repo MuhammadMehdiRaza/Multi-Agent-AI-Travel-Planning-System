@@ -1,39 +1,66 @@
 /**
  * ResultsPanel.tsx
- * Section labels with dividers, vertical stepper pipeline, premium final plan card.
+ * Lays out one planning run: the guardrail verdict, the supervisor's routing
+ * decision, the agent pipeline, the human approval gate, and the final plan.
  */
 
 import type { CSSProperties } from "react";
-import { Sparkles } from "lucide-react";
+import { ShieldAlert, Sparkles } from "lucide-react";
 import AgentStep from "./AgentStep";
-import type { TravelResponse } from "../api/travel";
+import type { StepState } from "./AgentStep";
+import ApprovalPanel from "./ApprovalPanel";
+import SupervisorPlan from "./SupervisorPlan";
+import type { AgentKey, PlanResponse } from "../api/travel";
 
 interface ResultsPanelProps {
-  isLoading: boolean;
-  result: TravelResponse | null;
+  isPlanning: boolean;
+  isApproving: boolean;
+  result: PlanResponse | null;
   error: string | null;
+  onApproval: (approved: boolean, feedback: string) => void;
 }
 
-const AGENTS = [
+const PIPELINE: {
+  key: AgentKey;
+  title: string;
+  subtitle: string;
+  icon: "plane" | "hotel" | "cloud" | "wallet" | "map";
+  field: keyof PlanResponse;
+}[] = [
   {
+    key: "flight_agent",
     title: "Flight Agent",
-    subtitle: "Fetches live flight data via Aviationstack",
-    key: "flight_results" as keyof TravelResponse,
+    subtitle: "Airports and airlines via the AviationStack MCP server",
+    icon: "plane",
+    field: "flight_results",
   },
   {
+    key: "hotel_agent",
     title: "Hotel Agent",
-    subtitle: "Finds hotels and accommodation via Tavily Search",
-    key: "hotel_results" as keyof TravelResponse,
+    subtitle: "Accommodation search via the Tavily MCP server",
+    icon: "hotel",
+    field: "hotel_results",
   },
   {
+    key: "weather_agent",
+    title: "Weather Agent",
+    subtitle: "Conditions and forecast via the weather MCP server",
+    icon: "cloud",
+    field: "weather_results",
+  },
+  {
+    key: "budget_agent",
+    title: "Budget Agent",
+    subtitle: "Cost feasibility across the other agents' findings",
+    icon: "wallet",
+    field: "budget_results",
+  },
+  {
+    key: "itinerary_agent",
     title: "Itinerary Agent",
-    subtitle: "Builds a day-by-day plan using Groq LLM",
-    key: "itinerary" as keyof TravelResponse,
-  },
-  {
-    title: "Final Agent",
-    subtitle: "Compiles and polishes the complete travel response",
-    key: "final_response" as keyof TravelResponse,
+    subtitle: "Assembles the draft plan for human review",
+    icon: "map",
+    field: "itinerary",
   },
 ];
 
@@ -43,23 +70,19 @@ const s: Record<string, CSSProperties> = {
     alignItems: "center",
     gap: "10px",
     marginBottom: "16px",
+    marginTop: "28px",
   },
   sectionLabel: {
     fontSize: "11px",
     fontWeight: 600,
     color: "var(--text-400)",
-    textTransform: "uppercase" as const,
+    textTransform: "uppercase",
     letterSpacing: "0.08em",
-    whiteSpace: "nowrap" as const,
+    whiteSpace: "nowrap",
     flexShrink: 0,
   },
-  sectionLine: {
-    flex: 1,
-    height: "1px",
-    backgroundColor: "var(--border)",
-  },
+  sectionLine: { flex: 1, height: "1px", backgroundColor: "var(--border)" },
 
-  /* Error */
   errorBox: {
     backgroundColor: "var(--red-50)",
     border: "1px solid #fecaca",
@@ -71,10 +94,21 @@ const s: Record<string, CSSProperties> = {
     lineHeight: 1.6,
   },
 
-  /* Final plan */
-  finalWrap: {
-    marginTop: "28px",
+  blockedCard: {
+    backgroundColor: "var(--white)",
+    border: "1px solid #fecaca",
+    borderLeft: "3px solid var(--red-600)",
+    borderRadius: "var(--r-lg)",
+    padding: "18px 20px",
+    display: "flex",
+    gap: "12px",
+    alignItems: "flex-start",
+    boxShadow: "var(--shadow-sm)",
   },
+  blockedTitle: { fontSize: "13px", fontWeight: 600, color: "var(--text-900)", marginBottom: "4px" },
+  blockedBody: { fontSize: "13px", color: "var(--text-700)", lineHeight: 1.7 },
+  blockedNote: { fontSize: "12px", color: "var(--text-400)", marginTop: "8px", lineHeight: 1.6 },
+
   finalCard: {
     backgroundColor: "var(--white)",
     border: "1px solid var(--border)",
@@ -90,12 +124,10 @@ const s: Record<string, CSSProperties> = {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
+    gap: "12px",
+    flexWrap: "wrap",
   },
-  finalHeadLeft: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-  },
+  finalHeadLeft: { display: "flex", alignItems: "center", gap: "8px" },
   finalIconWrap: {
     width: "28px",
     height: "28px",
@@ -107,17 +139,14 @@ const s: Record<string, CSSProperties> = {
     justifyContent: "center",
     color: "var(--indigo-600)",
   },
-  finalTitle: {
-    fontSize: "13px",
-    fontWeight: 600,
-    color: "var(--text-900)",
-  },
+  finalTitle: { fontSize: "13px", fontWeight: 600, color: "var(--text-900)" },
   finalMeta: {
     fontSize: "12px",
     color: "var(--text-400)",
     display: "flex",
     alignItems: "center",
     gap: "6px",
+    flexWrap: "wrap",
   },
   metaDot: {
     width: "4px",
@@ -131,65 +160,136 @@ const s: Record<string, CSSProperties> = {
     fontSize: "14px",
     color: "var(--text-700)",
     lineHeight: 1.85,
-    whiteSpace: "pre-wrap" as const,
+    whiteSpace: "pre-wrap",
+  },
+  revisionBadge: {
+    fontSize: "11px",
+    fontWeight: 500,
+    color: "var(--indigo-600)",
+    backgroundColor: "var(--indigo-50)",
+    border: "1px solid var(--indigo-100)",
+    borderRadius: "99px",
+    padding: "3px 10px",
   },
 };
 
-export default function ResultsPanel({ isLoading, result, error }: ResultsPanelProps) {
-  if (!isLoading && !result && !error) return null;
+function SectionLabel({ children }: { children: string }) {
+  return (
+    <div style={s.sectionRow}>
+      <span style={s.sectionLabel}>{children}</span>
+      <div style={s.sectionLine} />
+    </div>
+  );
+}
+
+export default function ResultsPanel({
+  isPlanning,
+  isApproving,
+  result,
+  error,
+  onApproval,
+}: ResultsPanelProps) {
+  if (!isPlanning && !result && !error) return null;
+
+  // While the first request is in flight there is no supervisor decision yet, so
+  // every step shows as running rather than pretending to know what was skipped.
+  const stepState = (key: AgentKey, hasContent: boolean): StepState => {
+    if (isPlanning) return "running";
+    if (!result) return "waiting";
+    if (!result.selected_agents.includes(key)) return "skipped";
+    return hasContent ? "complete" : "waiting";
+  };
 
   return (
     <div>
-      {/* Error */}
       {error && <div style={s.errorBox}>{error}</div>}
 
-      {/* Agent pipeline section */}
-      <div style={s.sectionRow}>
-        <span style={s.sectionLabel}>Agent pipeline</span>
-        <div style={s.sectionLine} />
-      </div>
-
-      {/* Vertical stepper */}
-      <div style={{ paddingLeft: "0" }}>
-        {AGENTS.map((a, i) => (
-          <AgentStep
-            key={a.key}
-            stepNumber={i + 1}
-            title={a.title}
-            subtitle={a.subtitle}
-            content={result ? String(result[a.key] ?? "") : ""}
-            isLoading={isLoading}
-            isComplete={!!result}
-            isLast={i === AGENTS.length - 1}
-          />
-        ))}
-      </div>
-
-      {/* Final travel plan */}
-      {result?.final_response && (
-        <div style={s.finalWrap}>
-          <div style={s.sectionRow}>
-            <span style={s.sectionLabel}>Your travel plan</span>
-            <div style={s.sectionLine} />
+      {result?.blocked && (
+        <>
+          <SectionLabel>Input guardrail</SectionLabel>
+          <div style={s.blockedCard} className="fade-up">
+            <ShieldAlert size={18} color="var(--red-600)" style={{ flexShrink: 0, marginTop: "1px" }} />
+            <div>
+              <div style={s.blockedTitle}>Request rejected before any agent ran</div>
+              <div style={s.blockedBody}>{result.blocked_reason}</div>
+              <div style={s.blockedNote}>
+                The guardrail runs ahead of the supervisor, so a rejected request costs one
+                model call instead of a full pipeline of external API requests.
+              </div>
+            </div>
           </div>
+        </>
+      )}
 
+      {result && !result.blocked && (
+        <>
+          <SectionLabel>Supervisor</SectionLabel>
+          <SupervisorPlan
+            selectedAgents={result.selected_agents}
+            reasoning={result.supervisor_reasoning}
+            constraints={result.trip_constraints}
+          />
+        </>
+      )}
+
+      {(isPlanning || (result && !result.blocked)) && (
+        <>
+          <SectionLabel>Agent pipeline</SectionLabel>
+          <div>
+            {PIPELINE.map((step, index) => {
+              const content = result ? String(result[step.field] ?? "") : "";
+              return (
+                <AgentStep
+                  key={step.key}
+                  title={step.title}
+                  subtitle={step.subtitle}
+                  icon={step.icon}
+                  content={content}
+                  state={stepState(step.key, Boolean(content))}
+                  isLast={index === PIPELINE.length - 1}
+                />
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {result?.awaiting_approval && (
+        <ApprovalPanel
+          prompt={result.approval_request}
+          isSubmitting={isApproving}
+          onSubmit={onApproval}
+        />
+      )}
+
+      {result?.final_response && (
+        <>
+          <SectionLabel>Your travel plan</SectionLabel>
           <div style={s.finalCard}>
             <div style={s.finalHeader}>
               <div style={s.finalHeadLeft}>
                 <div style={s.finalIconWrap}>
                   <Sparkles size={13} strokeWidth={2.5} />
                 </div>
-                <span style={s.finalTitle}>Complete Itinerary</span>
+                <span style={s.finalTitle}>
+                  {result.approved ? "Approved itinerary" : "Revised itinerary"}
+                </span>
+                {!result.approved && <span style={s.revisionBadge}>Rewritten from your feedback</span>}
               </div>
               <div style={s.finalMeta}>
-                <span>{result.llm_calls} LLM call{result.llm_calls !== 1 ? "s" : ""}</span>
+                <span>
+                  {result.llm_calls} model call{result.llm_calls === 1 ? "" : "s"}
+                </span>
                 <span style={s.metaDot} />
-                <span>4 agents</span>
+                <span>
+                  {result.selected_agents.length} agent
+                  {result.selected_agents.length === 1 ? "" : "s"} run
+                </span>
               </div>
             </div>
             <div style={s.finalBody}>{result.final_response}</div>
           </div>
-        </div>
+        </>
       )}
     </div>
   );

@@ -1,11 +1,26 @@
+# Agent orchestration
 langgraph
 langgraph-checkpoint-postgres
 langchain-core
+
+# LLM provider
 langchain-groq
+
+# Model Context Protocol: client adapters for LangGraph, plus the server SDK
+# used by weather_mcp_server.py
+langchain-mcp-adapters
+mcp
+
+# PostgreSQL, for checkpoints and conversation memory. The pool is required
+# because FastAPI serves requests from multiple threads.
 psycopg[binary,pool]
-tavily-python
-requests
-python-dotenv
+
+# Backend API
 fastapi
 uvicorn
 pydantic
+
+# Direct HTTP, used only inside the custom weather MCP server
+requests
+
+python-dotenv

@@ -1,196 +1,357 @@
 # Multi-Agent AI Travel Planning System
 
-A full-stack travel planning application powered by a multi-agent AI pipeline. The system coordinates four specialized agents — flight lookup, hotel search, itinerary generation, and final compilation — and presents results through a modern web interface built with React and TypeScript.
+A travel planning system built on LangGraph, in which a **supervisor agent** decides at
+runtime which specialist agents a request needs, every specialist gathers live data
+through **Model Context Protocol (MCP) servers** rather than hand-written API clients, an
+**input guardrail** screens requests before any of them run, and a **human reviews the
+draft plan** before it is finalised.
+
+Results are served by a FastAPI backend and presented in a React and TypeScript frontend
+that shows the routing decision, which agents were skipped and why, and the approval gate.
 
 ---
 
-## How It Works
+## What makes this multi-agent rather than a pipeline
 
-```
-Browser (React + TypeScript)
-        ↓  POST /api/chat
-FastAPI Server (api.py)
-        ↓  app.invoke(...)
-LangGraph Agent Graph (main.py)
-   ├── Flight Agent   →  Aviationstack API
-   ├── Hotel Agent    →  Tavily Search API
-   ├── Itinerary Agent →  Groq LLM (llama / gpt-oss)
-   └── Final Agent    →  Groq LLM
-        ↓
-PostgreSQL  (conversation memory via PostgresSaver)
-```
+Nothing in the workflow is hard-wired. Every specialist leaves through a conditional edge
+that asks the same question: given the supervisor's plan, which agent runs next?
 
----
-
-## Tech Stack
-
-| Layer | Technology |
+| Request | Agents that run |
 |---|---|
-| Agent Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) |
-| LLM | ChatGroq — `openai/gpt-oss-120b` |
-| Flight Data | [Aviationstack API](https://aviationstack.com/) |
-| Web / Hotel Search | [Tavily Search API](https://tavily.com/) |
-| State Persistence | PostgreSQL via `PostgresSaver` |
-| Backend API | FastAPI + Uvicorn |
-| Frontend | React 19 + TypeScript (Vite) |
-| Icons | Lucide React |
+| `What is the weather in Tokyo?` | weather, itinerary |
+| `Plan 4 days in Dubai from Karachi, budget 150000 PKR` | flight, hotel, budget, itinerary |
+| `Write me a linked list in Python` | none, the guardrail stops it |
+
+The guardrail exits straight to the end of the graph, so a rejected request costs one
+model call instead of five agents' worth of paid API requests.
+
+```mermaid
+graph TD;
+	__start__([__start__]):::first
+	supervisor(supervisor)
+	flight_agent(flight_agent)
+	hotel_agent(hotel_agent)
+	weather_agent(weather_agent)
+	budget_agent(budget_agent)
+	itinerary_agent(itinerary_agent)
+	human_approval(human_approval)
+	final_response(final_response)
+	__end__([__end__]):::last
+	__start__ --> supervisor;
+	supervisor -. blocked .-> __end__;
+	supervisor -.-> flight_agent;
+	supervisor -.-> hotel_agent;
+	supervisor -.-> weather_agent;
+	supervisor -.-> budget_agent;
+	supervisor -.-> itinerary_agent;
+	flight_agent -.-> hotel_agent;
+	flight_agent -.-> weather_agent;
+	flight_agent -.-> budget_agent;
+	flight_agent -.-> itinerary_agent;
+	hotel_agent -.-> weather_agent;
+	hotel_agent -.-> budget_agent;
+	hotel_agent -.-> itinerary_agent;
+	weather_agent -.-> budget_agent;
+	weather_agent -.-> itinerary_agent;
+	budget_agent -.-> itinerary_agent;
+	itinerary_agent --> human_approval;
+	human_approval --> final_response;
+	final_response --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
+Regenerate this diagram at any time with `python graph.py`.
 
 ---
 
-## Project Structure
+## Architecture
+
+```
+Browser (React 19 + TypeScript)
+    |  POST /api/plan          run until the approval node suspends the graph
+    |  POST /api/approve       resume the same run with the reviewer's answer
+    v
+FastAPI  (api.py)
+    v
+LangGraph  (graph.py -> agents.py -> state.py)
+    |
+    |-- Supervisor        input guardrail, then dynamic agent selection
+    |-- Flight Agent      -> AviationStack MCP server  (local, stdio)
+    |-- Hotel Agent       -> Tavily MCP server         (remote, streamable HTTP)
+    |-- Weather Agent     -> Weather MCP server        (local, stdio, written here)
+    |-- Budget Agent      -> Groq LLM over the other agents' findings
+    |-- Itinerary Agent   -> draft plan for review
+    |-- Human Approval    -> interrupt(), waits for a person
+    |-- Final Response    -> honours approval or rewrites from feedback
+    v
+PostgreSQL  (checkpoints: conversation memory and suspended runs)
+```
+
+### The three MCP servers
+
+| Server | Transport | Origin | Tools used |
+|---|---|---|---|
+| Tavily | Remote, streamable HTTP | Hosted by Tavily | `tavily_search` |
+| AviationStack | Local subprocess, stdio | [Pradumnasaraf/aviationstack-mcp](https://github.com/Pradumnasaraf/aviationstack-mcp) | `list_airports`, `list_airlines` |
+| Weather | Local subprocess, stdio | `weather_mcp_server.py` in this repo | `get_current_weather`, `get_forecast` |
+
+Tools are discovered at runtime, so adding a server changes no agent code. Run
+`python check_mcp_servers.py` to see every tool the system can currently reach.
+
+---
+
+## Why human-in-the-loop makes this a two-call API
+
+One HTTP request cannot both produce a draft and collect a person's verdict on it, so the
+run is split at the approval node. `interrupt()` suspends the graph and LangGraph writes
+its exact position to PostgreSQL. `POST /api/approve` later resumes it with
+`Command(resume=...)`, on a different worker thread and potentially minutes later.
+`thread_id` is the only thing linking the two calls, which is also why a page reload can
+recover a pending draft through `GET /api/thread/{thread_id}`.
+
+---
+
+## Project layout
 
 ```
 Multi Agent System Demo/
-├── frontend/                      # React + TypeScript UI
-│   ├── src/
-│   │   ├── api/
-│   │   │   └── travel.ts          # API helper — calls the FastAPI backend
-│   │   ├── components/
-│   │   │   ├── AgentStep.tsx      # Vertical stepper card per agent
-│   │   │   ├── ResultsPanel.tsx   # Pipeline view + final plan card
-│   │   │   └── SearchBar.tsx      # Session name + query form
-│   │   ├── App.tsx                # Root layout and state
-│   │   ├── index.css              # Design tokens + animations
-│   │   └── main.tsx               # React entry point
-│   ├── index.html
-│   └── package.json
-├── tools/
-│   ├── flight_tool.py             # Aviationstack API client
-│   └── tavily_tool.py             # Tavily Search API client
-├── api.py                         # FastAPI server wrapping the LangGraph app
-├── main.py                        # Agent graph definition and state schema
-├── requirements.txt               # Python dependencies
-├── .env                           # Environment variables (not committed)
-├── .gitignore
-├── LICENSE
+├── config.py                 # env, model factory, MCP server locations
+├── state.py                  # TravelState, the shared object every node reads
+├── mcp_client.py             # one MCP client over three servers, plus tool wrappers
+├── agents.py                 # the eight graph nodes
+├── graph.py                  # nodes, conditional edges, PostgreSQL checkpointer
+├── weather_mcp_server.py     # custom MCP server for OpenWeatherMap
+├── api.py                    # FastAPI, two-phase planning endpoints
+├── main.py                   # CLI entry point, same graph
+├── check_mcp_servers.py      # MCP connectivity and tool discovery check
+├── tests/
+│   └── test_workflow.py      # end-to-end checks: guardrail, routing, HITL, memory
+├── frontend/
+│   └── src/
+│       ├── api/travel.ts             # the only module that calls the backend
+│       ├── components/
+│       │   ├── SearchBar.tsx         # request form
+│       │   ├── SupervisorPlan.tsx    # routing decision and extracted constraints
+│       │   ├── AgentStep.tsx         # one pipeline step, including skipped
+│       │   ├── ApprovalPanel.tsx     # the human-in-the-loop gate
+│       │   └── ResultsPanel.tsx      # layout for a whole run
+│       └── App.tsx                   # two-phase flow
+├── requirements.txt
+├── .env.example
 └── README.md
 ```
 
 ---
 
-## Prerequisites
-
-- Python 3.10 or higher
-- Node.js 18 or higher
-- A running PostgreSQL instance
-- API keys from:
-  - [Groq Cloud](https://console.groq.com/)
-  - [Tavily](https://tavily.com/)
-  - [Aviationstack](https://aviationstack.com/)
-
----
-
 ## Setup
 
-**1. Clone the repository**
+### Prerequisites
 
-```bash
-git clone https://github.com/MuhammadMehdiRaza/Multi-Agent-AI-Travel-Planning-System.git
-cd "Multi-Agent-AI-Travel-Planning-System"
-```
+- Python 3.10 or newer for the app, and Python 3.13 or newer for the AviationStack MCP server
+- Node.js 18 or newer
+- A running PostgreSQL instance
+- `uv` for installing the AviationStack server: `pip install uv`
 
-**2. Create and activate a Python virtual environment**
+### 1. Python environment
 
 ```bash
 python -m venv LangGraphenv
-```
-
-```bash
-# Windows
-LangGraphenv\Scripts\activate
-
-# Linux / macOS
-source LangGraphenv/bin/activate
-```
-
-**3. Install Python dependencies**
-
-```bash
+LangGraphenv\Scripts\activate          # Windows
+source LangGraphenv/bin/activate       # Linux or macOS
 pip install -r requirements.txt
 ```
 
-**4. Create a `.env` file in the project root**
+### 2. Database
 
-```env
-GROQ_API_KEY=your_groq_api_key
-AVIATIONSTACK_API_KEY=your_aviationstack_api_key
-TAVILY_API_KEY=your_tavily_api_key
-DATABASE_URL=postgresql://username:password@localhost:5432/your_database
+```sql
+CREATE DATABASE langgraph_demo_memory;
 ```
 
-**5. Install frontend dependencies**
+LangGraph creates its own checkpoint tables on first run.
+
+### 3. Credentials
+
+Copy `.env.example` to `.env` and fill in the keys.
+
+| Variable | Where to get it | Needed for |
+|---|---|---|
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) | every agent |
+| `TAVILY_API_KEY` | [tavily.com](https://tavily.com) | hotel search |
+| `AVIATIONSTACK_API_KEY` | [aviationstack.com](https://aviationstack.com/signup/free) | flight data |
+| `OPENWEATHER_API_KEY` | [openweathermap.org/api](https://openweathermap.org/api) | weather |
+| `DATABASE_URL` | your PostgreSQL instance | memory and approval resume |
+
+A missing key degrades one section of the plan rather than failing the run. The frontend
+reads `/api/health` on load and warns about any MCP server that could not start.
+
+### 4. AviationStack MCP server
+
+It needs its own environment because it requires Python 3.13.
+
+```bash
+git clone https://github.com/Pradumnasaraf/aviationstack-mcp.git
+cd aviationstack-mcp
+uv sync
+```
+
+Keep it at `aviationstack-mcp/` inside the project. `config.py` finds the interpreter
+relative to the repository root, so no absolute paths need editing.
+
+### 5. Frontend
 
 ```bash
 cd frontend
 npm install
 ```
 
----
-
-## Running the Application
-
-You need two terminals running simultaneously.
-
-**Terminal 1 — Backend API** (from the project root, with venv active):
+### 6. Check the MCP servers
 
 ```bash
+python check_mcp_servers.py
+```
+
+---
+
+## Running
+
+Two terminals.
+
+```bash
+# Terminal 1, from the project root
 uvicorn api:server --reload --port 8000
 ```
 
-**Terminal 2 — Frontend** (from the `frontend/` directory):
-
 ```bash
+# Terminal 2, from frontend/
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173) in your browser.
+Open <http://localhost:5173>.
+
+There is also a CLI that drives the same graph, including the approval prompt:
+
+```bash
+python main.py
+python main.py --thread mehdi     # resume an earlier conversation
+```
+
+### Using the app
+
+1. Enter a **session name**. It is the thread id, so reusing it continues that conversation.
+2. Describe the trip. Be specific about destination, dates, budget, and preferences.
+3. The supervisor panel shows which specialists it scheduled and which it skipped.
+4. Review the draft, then **approve** it or **request changes** with feedback.
+5. Approving polishes the draft. Requesting changes has the final agent rewrite it.
 
 ---
 
-## Using the App
+## Shared state
 
-1. Enter a **session name** (e.g. your name). Using the same name on future visits lets the system remember your conversation history.
-2. Type a **travel request** — be as specific as you like (destination, dates, budget, preferences).
-3. Click **Plan trip** and watch the four agents work through the pipeline.
-4. The final itinerary appears in the **Your travel plan** section once all agents complete.
+Every node reads and writes one `TravelState` dictionary. Only `messages` accumulates;
+other keys are replaced by the node that owns them. The type is `total=False` because the
+supervisor decides at runtime which keys get populated, so readers use `.get()` rather
+than indexing.
 
----
-
-## Agent State Schema
-
-The LangGraph graph passes a shared `TravelState` object through each node:
-
-| Field | Type | Description |
+| Field | Written by | Purpose |
 |---|---|---|
-| `messages` | `list[AnyMessage]` | Full conversation history |
-| `user_query` | `str` | The raw travel query from the user |
-| `flight_results` | `str` | Output from the flight lookup agent |
-| `hotel_results` | `str` | Output from the hotel search agent |
-| `itinerary` | `str` | Generated day-by-day itinerary |
-| `llm_calls` | `int` | Number of LLM calls made in this run |
+| `messages` | every node | conversation history, appended not replaced |
+| `user_id`, `user_query` | caller | the request |
+| `guardrail_blocked`, `guardrail_reason` | supervisor | guardrail verdict |
+| `selected_agents` | supervisor | drives every conditional edge |
+| `supervisor_reasoning` | supervisor | why those agents |
+| `trip_constraints` | supervisor | destination, origin, duration, budget, style |
+| `flight_results` | flight agent | airports, airlines, fare guidance |
+| `hotel_results` | hotel agent | accommodation and neighbourhoods |
+| `weather_results` | weather agent | current conditions and forecast |
+| `budget_results` | budget agent | cost feasibility |
+| `itinerary` | itinerary agent | the draft under review |
+| `approval_request` | itinerary agent | what the reviewer is asked |
+| `approved`, `human_feedback` | human approval | the reviewer's answer |
+| `final_response` | final agent | the plan the user reads |
+| `llm_calls` | several | simple cost counter |
+
+---
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/plan` | Run the guardrail, supervisor, and selected specialists. Stops at approval. |
+| `POST` | `/api/approve` | Resume the suspended run with `approved` and `feedback`. |
+| `GET` | `/api/thread/{thread_id}` | Read a thread's latest checkpoint, including a pending draft. |
+| `GET` | `/api/health` | Model in use and which MCP servers started. |
+
+Interactive documentation is at <http://localhost:8000/docs>.
+
+---
+
+## Tests
+
+```bash
+python tests/test_workflow.py
+```
+
+These are integration tests. They call Groq, the MCP servers, and PostgreSQL, and cover
+the behaviour that is easy to break:
+
+- the guardrail rejects off-topic and empty requests, and stops the graph rather than
+  letting it run on to the approval node
+- an empty request is rejected without spending a model call
+- a weather-only request routes to two agents and produces no flight output
+- a full trip request runs several specialists and suspends for approval
+- resuming with a rejection and feedback produces a plan that differs from the draft
+- the PostgreSQL checkpoint retains the thread after the run
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Orchestration | LangGraph, conditional edges, `interrupt()` |
+| Tool protocol | Model Context Protocol via `langchain-mcp-adapters` and `mcp` |
+| LLM | Groq, `openai/gpt-oss-120b` by default, set `GROQ_MODEL` to change it |
+| Flight data | AviationStack, through a local MCP server |
+| Web and hotel search | Tavily, through a remote MCP server |
+| Weather | OpenWeatherMap, through an MCP server written in this repo |
+| State and memory | PostgreSQL via `PostgresSaver` over a `ConnectionPool` |
+| Backend | FastAPI, Uvicorn, Pydantic |
+| Frontend | React 19, TypeScript, Vite, Lucide icons |
+
+---
+
+## Engineering notes
+
+A few decisions worth knowing about, since they are the parts most likely to be changed
+by someone extending this.
+
+- **The guardrail fails closed.** If it cannot reach a verdict the request is refused,
+  because the alternative is running five agents and spending API quota on input nothing
+  has validated. Routing, by contrast, fails open: a request the guardrail already
+  accepted falls back to running every specialist.
+- **The supervisor's agent list is normalised, not trusted.** Unknown names are dropped,
+  the canonical running order is restored, and the itinerary agent is always included,
+  because it is the node that produces the plan the user actually reads.
+- **MCP responses are unwrapped, not stringified.** Tool results arrive as typed content
+  blocks. Passing them through `str()` leaves a Python repr full of escaped newlines in
+  both the UI and the next agent's prompt, so `mcp_client.py` flattens the blocks and
+  renders search responses as a readable list.
+- **Prompt sections are clipped to a stated budget.** Groq's free tier caps a single
+  request at its tokens-per-minute allowance, and that cap counts the reserved output
+  tokens too. The draft itinerary is the one input that regularly runs past 8,000
+  characters, so it gets its own allowance in `agents.py`. Left unclipped it pushes the
+  final call over the limit, which fails a run at the last node after every other agent
+  has already been paid for.
+- **A connection pool, not a single connection.** FastAPI serves requests from a thread
+  pool and psycopg connections are not safe to share across threads.
+- **Each conditional edge declares only the destinations it can reach.** Handing every
+  node the full route map still runs correctly but claims edges that can never be taken,
+  which then show up in the rendered diagram.
 
 ---
 
 ## License
 
-MIT License
-
-Copyright (c) 2026
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT. See [LICENSE](LICENSE).

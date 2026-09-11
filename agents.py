@@ -39,6 +39,7 @@ from mcp_client import (
     format_search_results,
     list_airlines,
     list_airports,
+    redact,
     run_sync,
     tavily_search,
 )
@@ -77,14 +78,22 @@ MAX_ITINERARY_CHARS = 6000
 # -- Shared helpers -----------------------------------------------------------
 
 def _llm_text(system: str, prompt: str) -> str:
-    """One LLM turn with a system instruction, returning plain text."""
+    """
+    One LLM turn with a system instruction, returning plain text.
+
+    Reads `.text` rather than `.content`. AIMessage.content is typed
+    `str | list[str | dict]`, so a model that replies in content blocks would
+    hand every caller a list. `_json_from_llm` would then raise AttributeError
+    on .find(), which is not in the exception tuple the supervisor catches.
+    `.text` flattens blocks to a string and is a plain str for the common case.
+    """
     response = llm.invoke(
         [
             SystemMessage(content=system),
             HumanMessage(content=prompt),
         ]
     )
-    return response.content
+    return response.text
 
 
 def _json_from_llm(text: str) -> dict[str, Any]:
@@ -116,11 +125,17 @@ def _mcp_text(coro, label: str, formatter=flatten_content) -> str:
     try:
         return formatter(run_sync(coro))
     except ToolUnavailable as exc:
-        log.warning("%s unavailable: %s", label, exc)
-        return "[" + label + " unavailable: " + str(exc) + "]"
+        log.warning("%s unavailable: %s", label, redact(exc))
+        return "[" + label + " unavailable: " + redact(exc) + "]"
     except Exception as exc:
-        log.warning("%s failed: %s: %s", label, type(exc).__name__, exc)
-        return "[" + label + " failed: " + type(exc).__name__ + ": " + str(exc) + "]"
+        # redact() is mandatory here, not defensive. The Tavily MCP endpoint
+        # carries its API key in the URL query string and httpx embeds the full
+        # request URL in HTTPStatusError, so an unredacted 401 would put a live
+        # credential into graph state, the checkpoint, the next prompt, and the
+        # browser.
+        detail = redact(exc)
+        log.warning("%s failed: %s: %s", label, type(exc).__name__, detail)
+        return "[" + label + " failed: " + type(exc).__name__ + ": " + detail + "]"
 
 
 def _clip(value: Any, limit: int = MAX_CONTEXT_CHARS) -> str:
@@ -199,9 +214,12 @@ def supervisor_agent(state: TravelState) -> dict[str, Any]:
     query = (state.get("user_query") or "").strip()
 
     # Cheap deterministic check first. No point paying for an LLM call to learn
-    # that the input box was empty.
+    # that the input box was empty. llm_calls_used is 0 because this branch
+    # genuinely does not reach the model.
     if len(query) < 3:
-        return _blocked("Please describe the trip you would like planned.", state)
+        return _blocked(
+            "Please describe the trip you would like planned.", state, llm_calls_used=0
+        )
 
     # Input guardrail. It runs before any specialist so a rejected request costs
     # one LLM call rather than five agents' worth of API quota.
@@ -265,8 +283,17 @@ def supervisor_agent(state: TravelState) -> dict[str, Any]:
     }
 
 
-def _blocked(reason: str, state: TravelState) -> dict[str, Any]:
-    """State update for a request the guardrail refused."""
+def _blocked(
+    reason: str, state: TravelState, llm_calls_used: int = 1
+) -> dict[str, Any]:
+    """
+    State update for a request the guardrail refused.
+
+    llm_calls_used is explicit because the two rejection paths cost different
+    amounts. The length check spends nothing; the guardrail itself spends one
+    call. Charging both the same made the counter report a model call that never
+    happened.
+    """
     return {
         "guardrail_blocked": True,
         "guardrail_reason": reason,
@@ -275,7 +302,7 @@ def _blocked(reason: str, state: TravelState) -> dict[str, Any]:
         "supervisor_reasoning": reason,
         "final_response": reason,
         "messages": [AIMessage(content=reason)],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "llm_calls": state.get("llm_calls", 0) + llm_calls_used,
     }
 
 

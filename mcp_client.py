@@ -18,6 +18,7 @@ instead of raising, so a partial configuration still produces a usable plan.
 import asyncio
 import concurrent.futures
 import json
+import re
 from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -35,6 +36,27 @@ from config import (
 
 class ToolUnavailable(RuntimeError):
     """Raised when a requested MCP tool is not exposed by any configured server."""
+
+
+# Query parameters whose values must never appear in a log line, an error
+# message, or anything stored in graph state.
+_SECRET_PARAMS = re.compile(
+    r"((?:api[-_]?key|apikey|access[-_]?key|token|tavilyApiKey)=)[^&\s'\"]+",
+    re.IGNORECASE,
+)
+
+
+def redact(text: Any) -> str:
+    """
+    Strip credentials out of text before it is logged or stored.
+
+    The Tavily MCP endpoint takes its key as a URL query parameter, and httpx
+    puts the full request URL into HTTPStatusError. Without this, a Tavily 401
+    or 429 would write the live API key into graph state, from there into the
+    PostgreSQL checkpoint, into the next agent's prompt, and onto the screen of
+    anyone watching the demo.
+    """
+    return _SECRET_PARAMS.sub(r"\1[REDACTED]", str(text))
 
 
 # -- Server registry ----------------------------------------------------------

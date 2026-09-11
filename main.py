@@ -7,8 +7,9 @@ node suspends the graph, and a second invoke resumes it with the answer.
 
     python main.py
 
-Pass a thread id to continue an earlier conversation, since the PostgreSQL
-checkpointer keeps history per thread:
+Pass a thread id to reattach to an existing thread. The PostgreSQL checkpointer
+keeps each thread's run history, though no node feeds earlier turns back into a
+prompt yet:
 
     python main.py --thread mehdi
 

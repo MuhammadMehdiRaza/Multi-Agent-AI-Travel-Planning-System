@@ -192,7 +192,7 @@ export default function SearchBar({
             />
           </div>
           <span style={s.hint}>
-            Also the thread id. Reuse it to continue an earlier conversation.
+            Also the thread id. Reuse it to reattach to an existing thread.
           </span>
         </div>
 

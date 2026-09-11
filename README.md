@@ -86,7 +86,7 @@ LangGraph  (graph.py -> agents.py -> state.py)
     |-- Human Approval    -> interrupt(), waits for a person
     |-- Final Response    -> honours approval or rewrites from feedback
     v
-PostgreSQL  (checkpoints: conversation memory and suspended runs)
+PostgreSQL  (checkpoints: suspended runs and per-thread run history)
 ```
 
 ### The three MCP servers
@@ -127,7 +127,7 @@ Multi Agent System Demo/
 ├── main.py                   # CLI entry point, same graph
 ├── check_mcp_servers.py      # MCP connectivity and tool discovery check
 ├── tests/
-│   └── test_workflow.py      # end-to-end checks: guardrail, routing, HITL, memory
+│   └── test_workflow.py      # end-to-end checks: guardrail, routing, HITL, checkpoints
 ├── frontend/
 │   └── src/
 │       ├── api/travel.ts             # the only module that calls the backend
@@ -166,7 +166,7 @@ pip install -r requirements.txt
 ### 2. Database
 
 ```sql
-CREATE DATABASE langgraph_demo_memory;
+CREATE DATABASE langgraph_memory_demo;
 ```
 
 LangGraph creates its own checkpoint tables on first run.
@@ -181,7 +181,7 @@ Copy `.env.example` to `.env` and fill in the keys.
 | `TAVILY_API_KEY` | [tavily.com](https://tavily.com) | hotel search |
 | `AVIATIONSTACK_API_KEY` | [aviationstack.com](https://aviationstack.com/signup/free) | flight data |
 | `OPENWEATHER_API_KEY` | [openweathermap.org/api](https://openweathermap.org/api) | weather |
-| `DATABASE_URL` | your PostgreSQL instance | memory and approval resume |
+| `DATABASE_URL` | your PostgreSQL instance | checkpoints and approval resume |
 
 A missing key degrades one section of the plan rather than failing the run. The frontend
 reads `/api/health` on load and warns about any MCP server that could not start.
@@ -234,12 +234,14 @@ There is also a CLI that drives the same graph, including the approval prompt:
 
 ```bash
 python main.py
-python main.py --thread mehdi     # resume an earlier conversation
+python main.py --thread mehdi     # reattach to an existing thread
 ```
 
 ### Using the app
 
-1. Enter a **session name**. It is the thread id, so reusing it continues that conversation.
+1. Enter a **session name**. It is the thread id. It scopes the checkpoint, so a reload
+   recovers a pending draft. It does not yet carry earlier turns into new prompts. See
+   Known limitations.
 2. Describe the trip. Be specific about destination, dates, budget, and preferences.
 3. The supervisor panel shows which specialists it scheduled and which it skipped.
 4. Review the draft, then **approve** it or **request changes** with feedback.
@@ -316,7 +318,7 @@ the behaviour that is easy to break:
 | Flight data | AviationStack, through a local MCP server |
 | Web and hotel search | Tavily, through a remote MCP server |
 | Weather | OpenWeatherMap, through an MCP server written in this repo |
-| State and memory | PostgreSQL via `PostgresSaver` over a `ConnectionPool` |
+| State and checkpoints | PostgreSQL via `PostgresSaver` over a `ConnectionPool` |
 | Backend | FastAPI, Uvicorn, Pydantic |
 | Frontend | React 19, TypeScript, Vite, Lucide icons |
 
@@ -349,6 +351,61 @@ by someone extending this.
 - **Each conditional edge declares only the destinations it can reach.** Handing every
   node the full route map still runs correctly but claims edges that can never be taken,
   which then show up in the rendered diagram.
+
+---
+
+## Known limitations
+
+Written down deliberately, because each of these is a real gap and finding them yourself
+is faster than discovering them by poking at the code.
+
+**Not agentic in the strict sense.** There is exactly one genuine decision in the system:
+the supervisor's routing call, and that is a single-shot JSON classification rather than an
+agent loop. No node is given a tool list and left to choose. Two of the five specialists,
+hotel and weather, contain no model call at all. This is accurately an LLM workflow with an
+LLM router, and the word "multi-agent" is doing some work.
+
+**The specialists run sequentially when three of them could run in parallel.** Flight,
+hotel, and weather read only `user_query` and `trip_constraints`, so they are independent
+and belong in a fan-out. `route_from_supervisor` returns a single node name, so the whole
+`AGENT_ORDER` walk exists to schedule them one at a time. Before parallelising,
+`llm_calls` must become `Annotated[int, operator.add]`, because two branches writing a
+plain `int` in the same superstep raise `InvalidUpdateError`.
+
+**No streaming, so the UI overstates progress.** `api.py` uses `.invoke()`, so the client
+waits for the whole run. While it waits, every agent card shows as running, including the
+ones the supervisor skipped. `stream_mode="updates"` over server-sent events would give
+real per-node transitions.
+
+**The flight agent's tool use is shallow.** `list_airlines("")` returns ten arbitrary
+global airlines unrelated to the route, and `list_routes` is defined in `mcp_client.py` and
+never called. Strip the AviationStack tools out and the flight guidance barely changes.
+
+**Thread ids are an unauthenticated capability.** There is no auth, no rate limiting, and
+no ownership check. Anyone who guesses a thread id can read that plan through
+`GET /api/thread/{id}` or approve it through `POST /api/approve`. Since the id is a
+hand-typed session name, guessing is easy. Server-generated identifiers would remove the
+enumeration; real multi-tenancy needs an ownership table.
+
+**Tool output is not treated as untrusted.** Search results are third-party web content and
+they are interpolated into the budget, itinerary, and final prompts with no fencing and no
+instruction to treat them as data. The guardrail screens the user, not the web. Indirect
+prompt injection through a page that ranks for a hotel query is unmitigated.
+
+**Conversation memory is not implemented.** `messages` accumulates in the checkpoint but no
+node ever reads it and no prompt includes it, so a returning thread gets no benefit from
+its history. The checkpointer is doing real work for approval resume and reload recovery;
+it is not yet doing memory.
+
+**Import-time side effects.** `agents.py` builds the model and `graph.py` opens the pool and
+runs setup at import, so the modules cannot be imported without every credential and a live
+database. That is also why the tests are all integration tests: the deterministic logic that
+is easiest to test, routing, JSON extraction, clipping, selection normalising, has no unit
+tests, and there is no CI.
+
+**No version pins, and the tested interpreter is not the documented one.**
+`requirements.txt` pins nothing while the code depends on `interrupt`, `StateSnapshot`, and
+`langchain-mcp-adapters` session semantics. Development was on Python 3.14.
 
 ---
 

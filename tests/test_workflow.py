@@ -65,7 +65,14 @@ def test_guardrail_blocks_empty() -> None:
     print("\n2. Guardrail rejects an empty request without calling the model")
     state, _ = run("  ")
     check("request is marked blocked", bool(state.get("guardrail_blocked")))
-    check("only one llm_call was counted", state.get("llm_calls") == 1, str(state.get("llm_calls")))
+    # The whole point of the length check is that it costs nothing. Asserting 1
+    # here, as this test previously did, made it pass against the bug it was
+    # named for rather than against the behaviour.
+    check(
+        "no model call was charged",
+        state.get("llm_calls") == 0,
+        "llm_calls=" + str(state.get("llm_calls")),
+    )
 
 
 def test_supervisor_routes_narrow_request() -> None:

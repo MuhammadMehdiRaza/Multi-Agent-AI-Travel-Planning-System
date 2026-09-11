@@ -34,15 +34,18 @@ log = logging.getLogger(__name__)
 # -- Request and response shapes ----------------------------------------------
 
 class PlanRequest(BaseModel):
-    query: str = Field(min_length=1, description="The traveller's request.")
-    thread_id: str = Field(min_length=1, description="Conversation id, used for memory.")
-    user_id: str = "web_user"
+    # max_length is a cost control, not cosmetics. Each run spends about six
+    # Groq calls plus paid AviationStack, Tavily and OpenWeatherMap requests, so
+    # an unbounded query field is an invitation to drain four free tiers.
+    query: str = Field(min_length=1, max_length=2000, description="The traveller's request.")
+    thread_id: str = Field(min_length=1, max_length=128, description="Conversation id.")
+    user_id: str = Field(default="web_user", max_length=128)
 
 
 class ApprovalRequest(BaseModel):
-    thread_id: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1, max_length=128)
     approved: bool
-    feedback: str = ""
+    feedback: str = Field(default="", max_length=4000)
 
 
 class PlanResponse(BaseModel):
@@ -91,6 +94,21 @@ server.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _client_error(exc: Exception) -> str:
+    """
+    A safe 500 body.
+
+    Raw exception text is not safe to return. A psycopg failure carries the
+    database host and user, and an httpx failure carries the full request URL,
+    which for the Tavily MCP endpoint includes the API key. The detail goes to
+    the log; the client gets the type only.
+    """
+    return (
+        type(exc).__name__
+        + ": the planning service failed. Check the server log for details."
+    )
 
 
 def _to_response(thread_id: str, state: dict) -> PlanResponse:
@@ -161,6 +179,22 @@ def create_plan(request: PlanRequest) -> PlanResponse:
     config = {"configurable": {"thread_id": request.thread_id}}
 
     try:
+        # Starting a fresh run on a thread that is already suspended does not
+        # error: LangGraph restarts the graph from the beginning, overwrites
+        # user_query, and replaces the pending interrupt. The earlier draft is
+        # destroyed with no warning. Since the session name is hand-typed and
+        # persists across submissions, pressing the button twice is the normal
+        # way to hit this, so it has to be refused rather than absorbed.
+        snapshot = travel_app.get_state(config)
+        if snapshot.next:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This thread already has a plan waiting for your approval. "
+                    "Answer it first, or use a different session name."
+                ),
+            )
+
         state = travel_app.invoke(
             {
                 "messages": [HumanMessage(content=request.query)],
@@ -170,11 +204,11 @@ def create_plan(request: PlanRequest) -> PlanResponse:
             },
             config=config,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         log.exception("Planning run failed for thread %s", request.thread_id)
-        raise HTTPException(
-            status_code=500, detail=type(exc).__name__ + ": " + str(exc)
-        ) from exc
+        raise HTTPException(status_code=500, detail=_client_error(exc)) from exc
 
     return _to_response(request.thread_id, state)
 
@@ -187,26 +221,29 @@ def approve_plan(request: ApprovalRequest) -> PlanResponse:
     """
     config = {"configurable": {"thread_id": request.thread_id}}
 
-    snapshot = travel_app.get_state(config)
-
-    if not snapshot.next:
-        raise HTTPException(
-            status_code=409,
-            detail="No run is waiting for approval on this thread. Create a plan first.",
-        )
-
     try:
+        # get_state belongs inside the try. It reaches PostgreSQL, so a pool
+        # timeout or a connection error here would otherwise escape as an
+        # unhandled 500 with nothing in the log.
+        snapshot = travel_app.get_state(config)
+
+        if not snapshot.next:
+            raise HTTPException(
+                status_code=409,
+                detail="No run is waiting for approval on this thread. Create a plan first.",
+            )
+
         state = travel_app.invoke(
             Command(
                 resume={"approved": request.approved, "feedback": request.feedback}
             ),
             config=config,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         log.exception("Approval resume failed for thread %s", request.thread_id)
-        raise HTTPException(
-            status_code=500, detail=type(exc).__name__ + ": " + str(exc)
-        ) from exc
+        raise HTTPException(status_code=500, detail=_client_error(exc)) from exc
 
     return _to_response(request.thread_id, state)
 
@@ -215,7 +252,12 @@ def approve_plan(request: ApprovalRequest) -> PlanResponse:
 def read_thread(thread_id: str) -> PlanResponse:
     """Read a thread's latest checkpoint, so a reload does not lose the draft."""
     config = {"configurable": {"thread_id": thread_id}}
-    snapshot = travel_app.get_state(config)
+
+    try:
+        snapshot = travel_app.get_state(config)
+    except Exception as exc:
+        log.exception("Could not read thread %s", thread_id)
+        raise HTTPException(status_code=500, detail=_client_error(exc)) from exc
 
     if not snapshot.created_at:
         raise HTTPException(status_code=404, detail="Unknown thread id.")

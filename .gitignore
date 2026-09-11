@@ -1,6 +1,18 @@
+# Secrets
 .env
+
+# Python
 LangGraphenv/
 __pycache__/
 *.pyc
+
+# Frontend
 frontend/node_modules/
 frontend/dist/
+
+# Third-party MCP server, cloned locally with its own virtual environment.
+# Setup instructions are in the README; the 59 MB checkout does not belong here.
+aviationstack-mcp/
+
+# Local run logs
+*.log

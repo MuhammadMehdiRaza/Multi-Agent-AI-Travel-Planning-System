@@ -15,16 +15,20 @@ to PostgreSQL, so the second call can arrive minutes later, from a different
 worker thread, and still resume exactly where the first one stopped.
 """
 
+import json
 import logging
+from collections.abc import Iterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from config import GROQ_MODEL
-from graph import app as travel_app
+from graph import get_app, shutdown
 from mcp_client import configured_servers, missing_servers
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -81,10 +85,26 @@ class PlanResponse(BaseModel):
 
 # -- App setup ----------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """
+    Build the graph and open the database pool on startup, close on shutdown.
+
+    Doing this here rather than at import keeps api.py importable without
+    credentials or a live PostgreSQL, which is what lets the unit tests run with
+    no external services. It also means a bad DATABASE_URL fails at startup with
+    a clear error instead of during the first request.
+    """
+    get_app()
+    yield
+    shutdown()
+
+
 server = FastAPI(
     title="Multi-Agent Travel Planning API",
     description="Supervisor routing, input guardrails, and human-in-the-loop over MCP servers.",
     version="3.0.0",
+    lifespan=lifespan,
 )
 
 # The Vite dev server runs on 5173. Without this the browser blocks the request.
@@ -185,7 +205,7 @@ def create_plan(request: PlanRequest) -> PlanResponse:
         # destroyed with no warning. Since the session name is hand-typed and
         # persists across submissions, pressing the button twice is the normal
         # way to hit this, so it has to be refused rather than absorbed.
-        snapshot = travel_app.get_state(config)
+        snapshot = get_app().get_state(config)
         if snapshot.next:
             raise HTTPException(
                 status_code=409,
@@ -195,7 +215,7 @@ def create_plan(request: PlanRequest) -> PlanResponse:
                 ),
             )
 
-        state = travel_app.invoke(
+        state = get_app().invoke(
             {
                 "messages": [HumanMessage(content=request.query)],
                 "user_id": request.user_id,
@@ -213,6 +233,103 @@ def create_plan(request: PlanRequest) -> PlanResponse:
     return _to_response(request.thread_id, state)
 
 
+@server.post("/api/plan/stream")
+def create_plan_stream(request: PlanRequest) -> StreamingResponse:
+    """
+    Phase one, streamed as newline-delimited JSON.
+
+    Same work as POST /api/plan, but it emits an event as each node finishes
+    instead of returning once at the end. That is what lets the UI light up the
+    agents that are actually running. Without it the client waits a minute or
+    more with nothing to show, which is why the interface used to display every
+    agent as running, including the ones the supervisor had skipped.
+
+    NDJSON over a POST body rather than server-sent events, because EventSource
+    is GET-only and the traveller's request does not belong in a URL.
+
+    Event shapes:
+      {"type": "supervisor", "selected_agents": [...], ...}
+      {"type": "node", "node": "flight_agent"}
+      {"type": "done", "result": {...PlanResponse...}}
+      {"type": "error", "detail": "..."}
+    """
+    config = {"configurable": {"thread_id": request.thread_id}}
+
+    def event(payload: dict) -> str:
+        return json.dumps(payload) + "\n"
+
+    def generate() -> Iterator[str]:
+        app = get_app()
+
+        try:
+            # Same guard as the non-streaming endpoint. A second run on a
+            # suspended thread would restart the graph and destroy the draft.
+            if app.get_state(config).next:
+                yield event(
+                    {
+                        "type": "error",
+                        "detail": (
+                            "This thread already has a plan waiting for your approval. "
+                            "Answer it first, or use a different session name."
+                        ),
+                    }
+                )
+                return
+
+            for chunk in app.stream(
+                {
+                    "messages": [HumanMessage(content=request.query)],
+                    "user_id": request.user_id,
+                    "user_query": request.query,
+                    "llm_calls": 0,
+                },
+                config=config,
+                stream_mode="updates",
+            ):
+                for node, update in chunk.items():
+                    if node == "__interrupt__":
+                        continue
+
+                    if node == "supervisor" and isinstance(update, dict):
+                        # Emitted separately so the client can grey out the
+                        # skipped agents immediately, rather than after the run.
+                        yield event(
+                            {
+                                "type": "supervisor",
+                                "selected_agents": update.get("selected_agents", []),
+                                "supervisor_reasoning": update.get(
+                                    "supervisor_reasoning", ""
+                                ),
+                                "trip_constraints": update.get("trip_constraints") or {},
+                                "blocked": bool(update.get("guardrail_blocked")),
+                                "blocked_reason": update.get("guardrail_reason", ""),
+                            }
+                        )
+                        continue
+
+                    yield event({"type": "node", "node": node})
+
+            # Read the settled state rather than accumulating the updates, so the
+            # final payload is identical to what /api/plan would have returned.
+            snapshot = app.get_state(config)
+            state = dict(snapshot.values)
+            if snapshot.interrupts:
+                state["__interrupt__"] = list(snapshot.interrupts)
+
+            yield event(
+                {
+                    "type": "done",
+                    "result": _to_response(request.thread_id, state).model_dump(),
+                }
+            )
+
+        except Exception as exc:
+            log.exception("Streamed planning run failed for thread %s", request.thread_id)
+            yield event({"type": "error", "detail": _client_error(exc)})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
 @server.post("/api/approve", response_model=PlanResponse)
 def approve_plan(request: ApprovalRequest) -> PlanResponse:
     """
@@ -225,7 +342,7 @@ def approve_plan(request: ApprovalRequest) -> PlanResponse:
         # get_state belongs inside the try. It reaches PostgreSQL, so a pool
         # timeout or a connection error here would otherwise escape as an
         # unhandled 500 with nothing in the log.
-        snapshot = travel_app.get_state(config)
+        snapshot = get_app().get_state(config)
 
         if not snapshot.next:
             raise HTTPException(
@@ -233,7 +350,7 @@ def approve_plan(request: ApprovalRequest) -> PlanResponse:
                 detail="No run is waiting for approval on this thread. Create a plan first.",
             )
 
-        state = travel_app.invoke(
+        state = get_app().invoke(
             Command(
                 resume={"approved": request.approved, "feedback": request.feedback}
             ),
@@ -254,7 +371,7 @@ def read_thread(thread_id: str) -> PlanResponse:
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        snapshot = travel_app.get_state(config)
+        snapshot = get_app().get_state(config)
     except Exception as exc:
         log.exception("Could not read thread %s", thread_id)
         raise HTTPException(status_code=500, detail=_client_error(exc)) from exc

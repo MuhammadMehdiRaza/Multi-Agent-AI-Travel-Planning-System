@@ -12,6 +12,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from pydantic import SecretStr
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -71,7 +72,9 @@ def get_llm(temperature: float = 0.3) -> ChatGroq:
     """
     return ChatGroq(
         model=GROQ_MODEL,
-        groq_api_key=GROQ_API_KEY,
+        # SecretStr keeps the key out of repr() and logs, and is the type the
+        # client actually declares.
+        api_key=SecretStr(GROQ_API_KEY) if GROQ_API_KEY else None,
         temperature=temperature,
         max_tokens=4096,
         max_retries=5,

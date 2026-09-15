@@ -50,5 +50,11 @@ class TravelState(TypedDict, total=False):
     # Final answer
     final_response: str
 
-    # Simple observability counter
-    llm_calls: int
+    # Model call counter.
+    #
+    # A reducer, not a plain int, because the three data-gathering specialists run
+    # in parallel. Two nodes writing a plain key in the same superstep raises
+    # InvalidUpdateError, and the old read-modify-write pattern,
+    # state.get("llm_calls", 0) + 1, only worked because execution was serial.
+    # Nodes now return the number of calls they made and LangGraph sums them.
+    llm_calls: Annotated[int, operator.add]

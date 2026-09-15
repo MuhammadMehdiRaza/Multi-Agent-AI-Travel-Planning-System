@@ -2,26 +2,47 @@
 graph.py - Graph assembly, dynamic routing, and the PostgreSQL checkpointer.
 
 The shape of this graph is what makes the system multi-agent rather than a fixed
-pipeline. There is no hard-coded chain of nodes. Every specialist leaves through a
-conditional edge that asks the same question: given the supervisor's plan, which
-agent should run next? A request for "what is the weather in Tokyo" runs two nodes;
-a full trip request runs all five.
+pipeline. Nothing is hard-wired. The supervisor decides which specialists a
+request needs, and the conditional edges follow that decision:
 
-    START -> supervisor -> (blocked) -----------------------------> END
-                        -> first selected specialist
-                             -> next selected specialist ...
+    START -> supervisor -> (blocked) ------------------------------------> END
+                        -> flight_agent  ┐
+                        -> hotel_agent   ├ in parallel, one superstep
+                        -> weather_agent ┘
+                             -> budget_agent (if selected)
                                   -> itinerary -> human_approval -> final -> END
+
+The three data-gathering specialists fan out. They read only `user_query` and
+`trip_constraints`, so they are genuinely independent, and running them
+sequentially cost the full sum of three network round trips for no reason. The
+supervisor's conditional edge returns a *list* of node names, which LangGraph
+schedules in a single superstep. Their outgoing edges then converge on one
+downstream node, which runs once rather than once per branch.
+
+Two things this required:
+
+  - `llm_calls` had to become a reducer in state.py. Two parallel nodes writing a
+    plain key in the same superstep raises InvalidUpdateError.
+  - The old AGENT_ORDER walk, which returned one node name at a time, is gone
+    along with the per-node route maps it needed.
+
+Nothing here runs at import. `get_app()` builds the graph and opens the database
+pool on first use, so this module can be imported, and the graph built with stub
+nodes, without credentials or a running PostgreSQL.
 """
 
-import atexit
 import logging
+from collections.abc import Hashable
 
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import RetryPolicy
+from psycopg import Connection
+from psycopg.rows import DictRow, dict_row
 from psycopg_pool import ConnectionPool
 
 from agents import (
-    AGENT_ORDER,
+    DATA_AGENTS,
     budget_agent,
     final_response_agent,
     flight_agent,
@@ -36,92 +57,124 @@ from state import TravelState
 
 log = logging.getLogger(__name__)
 
+# Node name -> implementation. Passing a replacement dict to build_graph is how
+# the tests exercise routing without calling a model.
 NODES = {
+    "supervisor": supervisor_agent,
     "flight_agent": flight_agent,
     "hotel_agent": hotel_agent,
     "weather_agent": weather_agent,
     "budget_agent": budget_agent,
     "itinerary_agent": itinerary_agent,
+    "human_approval": human_approval_agent,
+    "final_response": final_response_agent,
 }
 
-# Each conditional edge declares only the destinations its routing function can
-# actually return. Handing every node the full map would still run correctly, but
-# it would claim edges that can never be taken, and those phantom edges show up
-# in the rendered diagram and in any reachability check over the graph.
+# Destinations the supervisor's edge can return. "blocked" maps to END so a
+# request the guardrail refused stops immediately, instead of running the
+# itinerary and approval nodes over an empty state.
+SUPERVISOR_ROUTES: dict[Hashable, str] = {
+    "flight_agent": "flight_agent",
+    "hotel_agent": "hotel_agent",
+    "weather_agent": "weather_agent",
+    "budget_agent": "budget_agent",
+    "itinerary_agent": "itinerary_agent",
+    "blocked": END,
+}
+
+# Where a data specialist can go once it finishes.
+POST_DATA_ROUTES: dict[Hashable, str] = {
+    "budget_agent": "budget_agent",
+    "itinerary_agent": "itinerary_agent",
+}
+
+# Retry the nodes that call the model.
 #
-# "blocked" is the exit the guardrail uses. It maps to END so a rejected request
-# stops immediately instead of running the itinerary and approval nodes on
-# nothing, which is what a single shared route map would have caused.
-SUPERVISOR_ROUTES = {name: name for name in NODES} | {"blocked": END}
+# Without this, one transient Groq failure at the itinerary or final node threw
+# away every call the run had already paid for. LangGraph retries the node from
+# its own checkpoint, so completed nodes are not re-run and nothing is charged
+# twice. The approval node is deliberately excluded: retrying an interrupt would
+# re-ask the human.
+LLM_RETRY = RetryPolicy(max_attempts=3, initial_interval=1.0, backoff_factor=2.0)
 
-
-def _routes_after(current_agent: str) -> dict[str, str]:
-    """Only agents later in the running order, plus the itinerary terminus."""
-    position = AGENT_ORDER.index(current_agent)
-    reachable = AGENT_ORDER[position + 1 :]
-    return {name: name for name in reachable} | {"itinerary_agent": "itinerary_agent"}
+RETRY_NODES = {
+    "supervisor",
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+    "itinerary_agent",
+    "final_response",
+}
 
 
 # -- Routing ------------------------------------------------------------------
 
 def _selected(state: TravelState) -> list[str]:
-    """The supervisor's chosen agents, restored to canonical execution order."""
-    chosen = state.get("selected_agents") or []
-    return [agent for agent in AGENT_ORDER if agent in chosen]
+    return list(state.get("selected_agents") or [])
 
 
-def route_from_supervisor(state: TravelState) -> str:
-    """Leave the supervisor for the first selected specialist, or stop."""
+def route_from_supervisor(state: TravelState) -> str | list[str]:
+    """
+    Leave the supervisor for every selected data specialist at once.
+
+    Returning a list is the fan-out. When no data agent was selected, fall
+    through to whichever later stage was, so a budget-only or itinerary-only
+    request still reaches the node that answers it.
+    """
     if state.get("guardrail_blocked"):
         return "blocked"
 
     selected = _selected(state)
-    return selected[0] if selected else "itinerary_agent"
+
+    parallel = [agent for agent in DATA_AGENTS if agent in selected]
+    if parallel:
+        return parallel
+
+    if "budget_agent" in selected:
+        return "budget_agent"
+
+    return "itinerary_agent"
 
 
-def route_after(current_agent: str):
+def route_after_data(state: TravelState) -> str:
     """
-    Build the routing function for one specialist.
+    Where the data specialists converge.
 
-    It walks forward through AGENT_ORDER from the current node and returns the
-    next agent the supervisor actually selected, skipping the rest. The itinerary
-    node is the guaranteed terminus of the specialist chain.
+    All three return the same answer, so they meet at one node and LangGraph
+    runs it once. Budget has to come after them because it reasons over their
+    output; the itinerary node is the guaranteed terminus either way.
     """
-
-    def route(state: TravelState) -> str:
-        selected = _selected(state)
-        position = AGENT_ORDER.index(current_agent)
-
-        for candidate in AGENT_ORDER[position + 1 :]:
-            if candidate in selected:
-                return candidate
-
-        return "itinerary_agent"
-
-    return route
+    return "budget_agent" if "budget_agent" in _selected(state) else "itinerary_agent"
 
 
 # -- Assembly -----------------------------------------------------------------
 
-def build_graph(checkpointer=None):
-    """Wire the nodes and edges. Kept separate from compilation so tests can
-    build the graph without needing a database."""
+def build_graph(checkpointer=None, nodes: dict | None = None):
+    """
+    Wire the nodes and edges and compile.
+
+    `nodes` overrides the implementations by name. That is how the routing tests
+    run the real edges over stub nodes, with no model, no MCP servers and an
+    in-memory checkpointer.
+    """
+    implementations = {**NODES, **(nodes or {})}
+
     graph = StateGraph(TravelState)
 
-    graph.add_node("supervisor", supervisor_agent)
-    for name, node in NODES.items():
-        graph.add_node(name, node)
-    graph.add_node("human_approval", human_approval_agent)
-    graph.add_node("final_response", final_response_agent)
+    for name, node in implementations.items():
+        if name in RETRY_NODES:
+            graph.add_node(name, node, retry_policy=LLM_RETRY)
+        else:
+            graph.add_node(name, node)
 
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges("supervisor", route_from_supervisor, SUPERVISOR_ROUTES)
 
-    # Every specialist except the itinerary node routes dynamically.
-    for name in AGENT_ORDER:
-        if name != "itinerary_agent":
-            graph.add_conditional_edges(name, route_after(name), _routes_after(name))
+    for name in DATA_AGENTS:
+        graph.add_conditional_edges(name, route_after_data, POST_DATA_ROUTES)
 
+    graph.add_edge("budget_agent", "itinerary_agent")
     graph.add_edge("itinerary_agent", "human_approval")
     graph.add_edge("human_approval", "final_response")
     graph.add_edge("final_response", END)
@@ -129,41 +182,74 @@ def build_graph(checkpointer=None):
     return graph.compile(checkpointer=checkpointer)
 
 
+# -- Checkpointer and application factory -------------------------------------
+
+_app = None
+_pool: ConnectionPool[Connection[DictRow]] | None = None
+
+
 def build_checkpointer() -> PostgresSaver | None:
     """
-    Open the PostgreSQL checkpointer used for memory and for human-in-the-loop.
+    Open the PostgreSQL checkpointer that backs memory and human-in-the-loop.
 
-    A connection pool rather than a single connection, because FastAPI serves each
-    request on a worker thread and psycopg connections are not safe to share
+    A connection pool rather than a single connection, because FastAPI serves
+    requests from a thread pool and psycopg connections are not safe to share
     across threads. autocommit is required by PostgresSaver, and disabling
-    prepared statements keeps the saver working through connection poolers.
+    prepared statements keeps it working through external connection poolers.
     """
+    global _pool
+
     if not DATABASE_URL:
-        log.warning("DATABASE_URL is not set. Running without memory or HITL resume.")
+        log.warning(
+            "DATABASE_URL is not set. Running without checkpoints, so approval "
+            "cannot be resumed and a suspended run cannot be recovered."
+        )
         return None
 
-    pool = ConnectionPool(
+    _pool = ConnectionPool[Connection[DictRow]](
         conninfo=DATABASE_URL,
         min_size=1,
         max_size=10,
         open=True,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
+        # row_factory matches what PostgresSaver expects of a pool it is
+        # handed. Every query it runs sets dict_row on its own cursor, so
+        # this is belt and braces rather than a fix, but it keeps the pool
+        # type aligned with the saver's signature.
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
     )
 
-    # Close the pool while the interpreter is still healthy. Left to garbage
-    # collection at shutdown, the pool's worker threads cannot be joined and
-    # Python reports a finalization error on every exit.
-    atexit.register(pool.close)
-
-    checkpointer = PostgresSaver(pool)
+    checkpointer = PostgresSaver(_pool)
     checkpointer.setup()
 
     return checkpointer
 
 
-app = build_graph(build_checkpointer())
+def get_app():
+    """The compiled graph, built on first use. Safe to call repeatedly."""
+    global _app
+
+    if _app is None:
+        _app = build_graph(build_checkpointer())
+
+    return _app
+
+
+def shutdown() -> None:
+    """
+    Close the pool while the interpreter is still healthy.
+
+    Left to garbage collection at exit, the pool's worker threads cannot be
+    joined and Python reports a finalization error on every shutdown.
+    """
+    global _app, _pool
+
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+    _app = None
 
 
 if __name__ == "__main__":
-    # Print the graph as a Mermaid diagram, which renders directly on GitHub.
-    print(app.get_graph().draw_mermaid())
+    # The diagram needs no database, so build without a checkpointer.
+    print(build_graph().get_graph().draw_mermaid())

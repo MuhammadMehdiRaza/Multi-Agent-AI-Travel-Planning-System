@@ -24,7 +24,7 @@ import uuid
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from graph import app
+from graph import get_app, shutdown
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -50,6 +50,8 @@ def main() -> None:
     )
     parser.add_argument("--user", default="cli_user", help="User id recorded in state.")
     args = parser.parse_args()
+
+    app = get_app()
 
     thread_id = args.thread or "cli_" + uuid.uuid4().hex[:8]
     config = {"configurable": {"thread_id": thread_id}}
@@ -115,4 +117,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutdown()

@@ -19,9 +19,11 @@ import asyncio
 import concurrent.futures
 import json
 import re
+import threading
 from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.sessions import Connection
 
 from config import (
     AVIATION_STACK_API_KEY,
@@ -61,9 +63,9 @@ def redact(text: Any) -> str:
 
 # -- Server registry ----------------------------------------------------------
 
-def _build_server_config() -> dict[str, dict[str, Any]]:
+def _build_server_config() -> dict[str, Connection]:
     """Register only the MCP servers this machine can actually reach."""
-    servers: dict[str, dict[str, Any]] = {}
+    servers: dict[str, Connection] = {}
 
     if TAVILY_API_KEY:
         servers["tavily"] = {
@@ -134,6 +136,13 @@ def missing_servers() -> dict[str, str]:
 # request in a worker thread with a fresh loop.
 _tools_cache: list[Any] | None = None
 
+# A threading lock, not an asyncio one. FastAPI serves each request on its own
+# worker thread with its own event loop, so an asyncio.Lock created here would
+# belong to whichever loop touched it first. Two requests arriving with the cache
+# cold would otherwise both run full discovery, which means four extra
+# subprocess launches and a wasted Tavily round trip.
+_tools_lock = threading.Lock()
+
 
 async def get_tools(refresh: bool = False) -> list[Any]:
     """Discover every tool across all configured servers, caching the result."""
@@ -142,8 +151,14 @@ async def get_tools(refresh: bool = False) -> list[Any]:
     if client is None:
         return []
 
-    if _tools_cache is None or refresh:
-        _tools_cache = await client.get_tools()
+    if _tools_cache is not None and not refresh:
+        return _tools_cache
+
+    discovered = await client.get_tools()
+
+    with _tools_lock:
+        if _tools_cache is None or refresh:
+            _tools_cache = discovered
 
     return _tools_cache
 
@@ -191,6 +206,79 @@ def flatten_content(value: Any) -> str:
         return "\n".join(flatten_content(item) for item in value)
 
     return str(value)
+
+
+def describe_api_error(data: Any) -> str | None:
+    """
+    Recognise an AviationStack error envelope and explain it in one line.
+
+    The upstream server answers HTTP 200 with {"ok": false, "error": ...} when the
+    account's plan does not cover an endpoint. Pasting that JSON into a prompt
+    reads to the model as data rather than as a failure, so it gets translated
+    here. Returns None when the payload is not an error.
+    """
+    if not isinstance(data, dict) or data.get("ok") is not False:
+        return None
+
+    error = str(data.get("error", "unknown error"))
+
+    if "function_access_restricted" in error:
+        return (
+            "[Not available on this AviationStack plan. Free keys cover live "
+            "flight schedules only, not the airport, airline or route directories.]"
+        )
+
+    return "[AviationStack error: " + error[:200] + "]"
+
+
+def summarise_schedule(payload: Any, limit: int = 6) -> str:
+    """
+    Project a flight schedule response down to the fields a planner needs.
+
+    Each record carries eighteen fields including gates, terminals and three
+    separate timestamps per leg. Pasting the raw JSON meant the prompt budget
+    truncated it mid-value, handing the model syntactically broken input. This
+    keeps the airline, flight number, route and times, and drops the rest.
+    """
+    text = flatten_content(payload).strip()
+
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+
+    described = describe_api_error(data)
+    if described:
+        return described
+
+    if not isinstance(data, list):
+        return text
+
+    def clock(value: Any) -> str:
+        raw = str(value or "")
+        return raw[11:16] if len(raw) >= 16 else "--:--"
+
+    lines: list[str] = []
+
+    for item in data[:limit]:
+        if not isinstance(item, dict):
+            continue
+
+        airline = str(item.get("airline") or "Unknown airline")
+        number = str(item.get("flight_number") or "")
+        arrives = str(item.get("arrival_airport_code") or "")
+        delay = item.get("departure_delay")
+
+        parts = [
+            (airline + " " + number).strip(),
+            "to " + arrives if arrives else "",
+            "dep " + clock(item.get("departure_scheduled_time")),
+            "arr " + clock(item.get("arrival_scheduled_time")),
+            "delayed " + str(delay) + " min" if delay else "",
+        ]
+        lines.append("  " + "  ".join(part for part in parts if part))
+
+    return "\n".join(lines) if lines else "No scheduled flights returned."
 
 
 def format_search_results(payload: Any, limit: int = 5, snippet_chars: int = 320) -> str:
@@ -262,22 +350,24 @@ async def tavily_search(query: str) -> Any:
     return await call_tool("tavily_search", {"query": query})
 
 
-async def list_airports(search: str = "", limit: int = 10) -> Any:
+async def flight_schedule(
+    airport_iata: str, schedule_type: str = "departure", limit: int = 6
+) -> Any:
+    """
+    Live same-day arrivals or departures for one airport.
+
+    This is the only AviationStack endpoint a free key can reach. The airport,
+    airline and route directories all answer with function_access_restricted, so
+    the flight agent is built on this one and derives real carriers from it
+    rather than asking the model to recall which airlines fly a route.
+    """
     return await call_tool(
-        "list_airports", {"search": search, "limit": limit, "offset": 0}
-    )
-
-
-async def list_airlines(search: str = "", limit: int = 10) -> Any:
-    return await call_tool(
-        "list_airlines", {"search": search, "limit": limit, "offset": 0}
-    )
-
-
-async def list_routes(dep_iata: str = "", arr_iata: str = "", limit: int = 10) -> Any:
-    return await call_tool(
-        "list_routes",
-        {"dep_iata": dep_iata, "arr_iata": arr_iata, "limit": limit, "offset": 0},
+        "flight_arrival_departure_schedule",
+        {
+            "airport_iata_code": airport_iata,
+            "schedule_type": schedule_type,
+            "number_of_flights": limit,
+        },
     )
 
 

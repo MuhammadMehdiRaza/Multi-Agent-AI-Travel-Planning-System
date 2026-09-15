@@ -47,13 +47,20 @@ def get_current_weather(city: str) -> dict:
     if response.status_code != 200:
         return {"error": data.get("message", "Unknown OpenWeatherMap error")}
 
+    # .get() throughout, matching the rule the agent layer follows. A 200 with a
+    # partial body is uncommon but real, and indexing would turn it into a
+    # KeyError inside the MCP server rather than a usable answer.
+    main = data.get("main") or {}
+    weather = (data.get("weather") or [{}])[0]
+    wind = data.get("wind") or {}
+
     return {
         "city": data.get("name", city),
-        "temperature_c": data["main"]["temp"],
-        "feels_like_c": data["main"]["feels_like"],
-        "humidity": data["main"]["humidity"],
-        "condition": data["weather"][0]["description"],
-        "wind_speed": data["wind"]["speed"],
+        "temperature_c": main.get("temp"),
+        "feels_like_c": main.get("feels_like"),
+        "humidity": main.get("humidity"),
+        "condition": weather.get("description"),
+        "wind_speed": wind.get("speed"),
     }
 
 
@@ -78,11 +85,11 @@ def get_forecast(city: str, entries: int = 5) -> dict:
 
     forecast = [
         {
-            "datetime": item["dt_txt"],
-            "temperature_c": item["main"]["temp"],
-            "condition": item["weather"][0]["description"],
+            "datetime": item.get("dt_txt"),
+            "temperature_c": (item.get("main") or {}).get("temp"),
+            "condition": ((item.get("weather") or [{}])[0]).get("description"),
         }
-        for item in data.get("list", [])[: max(1, entries)]
+        for item in (data.get("list") or [])[: max(1, entries)]
     ]
 
     return {"city": city, "forecast": forecast}

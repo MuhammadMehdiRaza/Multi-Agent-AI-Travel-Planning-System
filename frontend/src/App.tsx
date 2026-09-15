@@ -13,8 +13,8 @@ import type { CSSProperties } from "react";
 import { AlertTriangle, Plane } from "lucide-react";
 import SearchBar from "./components/SearchBar";
 import ResultsPanel from "./components/ResultsPanel";
-import { createPlan, readHealth, submitApproval } from "./api/travel";
-import type { HealthResponse, PlanResponse } from "./api/travel";
+import { readHealth, streamPlan, submitApproval } from "./api/travel";
+import type { HealthResponse, PlanResponse, SupervisorEvent } from "./api/travel";
 import "./index.css";
 
 const s: Record<string, CSSProperties> = {
@@ -101,6 +101,13 @@ export default function App() {
   const [threadId, setThreadId] = useState("");
 
   const [result, setResult] = useState<PlanResponse | null>(null);
+
+  // Live progress while a run is in flight. `plan` is the supervisor's routing
+  // decision, which arrives before the specialists start, and `completed` is the
+  // set of nodes that have actually finished.
+  const [plan, setPlan] = useState<SupervisorEvent | null>(null);
+  const [completed, setCompleted] = useState<string[]>([]);
+
   const [isPlanning, setIsPlanning] = useState(false);
   const [isApproving, setIsApproving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,10 +124,20 @@ export default function App() {
   async function handlePlan() {
     setResult(null);
     setError(null);
+    setPlan(null);
+    setCompleted([]);
     setIsPlanning(true);
 
     try {
-      setResult(await createPlan(query, threadId));
+      // Streamed, so the pipeline shows which agent is actually running.
+      // `plan` and `completed` drive the display while the run is in flight;
+      // once it finishes, `result` takes over.
+      setResult(
+        await streamPlan(query, threadId, {
+          onSupervisor: setPlan,
+          onNode: (node) => setCompleted((done) => [...done, node]),
+        })
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Something went wrong.");
     } finally {
@@ -199,6 +216,8 @@ export default function App() {
           isPlanning={isPlanning}
           isApproving={isApproving}
           result={result}
+          livePlan={plan}
+          completedNodes={completed}
           error={error}
           onApproval={handleApproval}
         />

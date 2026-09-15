@@ -10,15 +10,23 @@ import AgentStep from "./AgentStep";
 import type { StepState } from "./AgentStep";
 import ApprovalPanel from "./ApprovalPanel";
 import SupervisorPlan from "./SupervisorPlan";
-import type { AgentKey, PlanResponse } from "../api/travel";
+import type { AgentKey, PlanResponse, SupervisorEvent, TripConstraints } from "../api/travel";
 
 interface ResultsPanelProps {
   isPlanning: boolean;
   isApproving: boolean;
   result: PlanResponse | null;
+  /** The supervisor's decision, streamed in before the specialists start. */
+  livePlan: SupervisorEvent | null;
+  /** Node names that have actually finished, in order of completion. */
+  completedNodes: string[];
   error: string | null;
   onApproval: (approved: boolean, feedback: string) => void;
 }
+
+// Mirrors DATA_AGENTS in agents.py. These three run in a single parallel
+// superstep, so while any of them is outstanding all three are genuinely active.
+const DATA_AGENT_KEYS: AgentKey[] = ["flight_agent", "hotel_agent", "weather_agent"];
 
 const PIPELINE: {
   key: AgentKey;
@@ -186,32 +194,65 @@ export default function ResultsPanel({
   isPlanning,
   isApproving,
   result,
+  livePlan,
+  completedNodes,
   error,
   onApproval,
 }: ResultsPanelProps) {
   if (!isPlanning && !result && !error) return null;
 
-  // While the first request is in flight there is no supervisor decision yet, so
-  // every step shows as running rather than pretending to know what was skipped.
+  // The routing decision, from the finished run if there is one, otherwise from
+  // the streamed supervisor event.
+  const selected: AgentKey[] | null =
+    result?.selected_agents ?? livePlan?.selected_agents ?? null;
+
+  const blocked = result?.blocked ?? livePlan?.blocked ?? false;
+  const blockedReason = result?.blocked_reason ?? livePlan?.blocked_reason ?? "";
+
+  /**
+   * Honest per-agent state.
+   *
+   * This used to return "running" for all five agents for the whole request,
+   * which misrepresented a sequential run and showed skipped agents as active.
+   * Now it is driven by the stream: an agent is running only once the supervisor
+   * has selected it and it is the next one not yet reported complete.
+   */
   const stepState = (key: AgentKey, hasContent: boolean): StepState => {
-    if (isPlanning) return "running";
-    if (!result) return "waiting";
-    if (!result.selected_agents.includes(key)) return "skipped";
-    return hasContent ? "complete" : "waiting";
+    if (result && !isPlanning) {
+      if (!result.selected_agents.includes(key)) return "skipped";
+      return hasContent ? "complete" : "waiting";
+    }
+
+    // Still streaming.
+    if (!selected) return "waiting";
+    if (!selected.includes(key)) return "skipped";
+    if (completedNodes.includes(key)) return "complete";
+
+    const pending = selected.filter((agent) => !completedNodes.includes(agent));
+
+    // The three data agents run in one parallel superstep, so if any of them is
+    // pending they are all genuinely in flight together.
+    if (DATA_AGENT_KEYS.includes(key)) {
+      return pending.some((agent) => DATA_AGENT_KEYS.includes(agent))
+        ? "running"
+        : "waiting";
+    }
+
+    return pending[0] === key ? "running" : "waiting";
   };
 
   return (
     <div>
       {error && <div style={s.errorBox}>{error}</div>}
 
-      {result?.blocked && (
+      {blocked && (
         <>
           <SectionLabel>Input guardrail</SectionLabel>
           <div style={s.blockedCard} className="fade-up">
             <ShieldAlert size={18} color="var(--red-600)" style={{ flexShrink: 0, marginTop: "1px" }} />
             <div>
               <div style={s.blockedTitle}>Request rejected before any agent ran</div>
-              <div style={s.blockedBody}>{result.blocked_reason}</div>
+              <div style={s.blockedBody}>{blockedReason}</div>
               <div style={s.blockedNote}>
                 The guardrail runs ahead of the supervisor, so a rejected request costs one
                 model call instead of a full pipeline of external API requests.
@@ -221,18 +262,24 @@ export default function ResultsPanel({
         </>
       )}
 
-      {result && !result.blocked && (
+      {selected && !blocked && (
         <>
           <SectionLabel>Supervisor</SectionLabel>
           <SupervisorPlan
-            selectedAgents={result.selected_agents}
-            reasoning={result.supervisor_reasoning}
-            constraints={result.trip_constraints}
+            selectedAgents={selected}
+            reasoning={
+              (result?.supervisor_reasoning || livePlan?.supervisor_reasoning) ?? ""
+            }
+            constraints={
+              (result?.trip_constraints ??
+                livePlan?.trip_constraints ??
+                {}) as TripConstraints
+            }
           />
         </>
       )}
 
-      {(isPlanning || (result && !result.blocked)) && (
+      {!blocked && (isPlanning || result) && (
         <>
           <SectionLabel>Agent pipeline</SectionLabel>
           <div>

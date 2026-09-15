@@ -1,0 +1,45 @@
+[project]
+name = "multi-agent-travel-planner"
+version = "3.1.0"
+description = "Supervisor-routed multi-agent travel planner over MCP servers, with guardrails and human-in-the-loop"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+markers = [
+    # Everything not marked integration must run with no credentials, no
+    # network and no database, so CI can run the suite on every push.
+    "integration: hits Groq, the MCP servers and PostgreSQL. Costs money and is not run in CI.",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["LangGraphenv", "aviationstack-mcp", "frontend"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "RET",  # return consistency
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+    "B008",  # FastAPI and Pydantic rely on calls in argument defaults
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["config.py", "state.py", "mcp_client.py", "agents.py", "graph.py", "api.py", "main.py", "weather_mcp_server.py"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Not strict mode. The value here is catching real type errors like the
+# AIMessage.content bug, not annotating every local variable.
+check_untyped_defs = true

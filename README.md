@@ -25,6 +25,14 @@ that asks the same question: given the supervisor's plan, which agent runs next?
 The guardrail exits straight to the end of the graph, so a rejected request costs one
 model call instead of five agents' worth of paid API requests.
 
+The three data-gathering specialists run **in parallel**. Flight, hotel and weather read
+only the request and the supervisor's constraints, so they are independent and the
+supervisor's conditional edge returns a list of node names, which LangGraph schedules as
+one superstep. Their edges then converge on a single downstream node, which runs once
+rather than once per branch. This is why `llm_calls` in `state.py` is an
+`Annotated[int, operator.add]` reducer: two parallel nodes writing a plain key in the same
+superstep raises `InvalidUpdateError`.
+
 ```mermaid
 graph TD;
 	__start__([__start__]):::first
@@ -44,16 +52,13 @@ graph TD;
 	supervisor -.-> weather_agent;
 	supervisor -.-> budget_agent;
 	supervisor -.-> itinerary_agent;
-	flight_agent -.-> hotel_agent;
-	flight_agent -.-> weather_agent;
 	flight_agent -.-> budget_agent;
 	flight_agent -.-> itinerary_agent;
-	hotel_agent -.-> weather_agent;
 	hotel_agent -.-> budget_agent;
 	hotel_agent -.-> itinerary_agent;
 	weather_agent -.-> budget_agent;
 	weather_agent -.-> itinerary_agent;
-	budget_agent -.-> itinerary_agent;
+	budget_agent --> itinerary_agent;
 	itinerary_agent --> human_approval;
 	human_approval --> final_response;
 	final_response --> __end__;
@@ -70,7 +75,7 @@ Regenerate this diagram at any time with `python graph.py`.
 
 ```
 Browser (React 19 + TypeScript)
-    |  POST /api/plan          run until the approval node suspends the graph
+    |  POST /api/plan/stream   NDJSON, one event per node as it finishes
     |  POST /api/approve       resume the same run with the reviewer's answer
     v
 FastAPI  (api.py)
@@ -78,9 +83,12 @@ FastAPI  (api.py)
 LangGraph  (graph.py -> agents.py -> state.py)
     |
     |-- Supervisor        input guardrail, then dynamic agent selection
-    |-- Flight Agent      -> AviationStack MCP server  (local, stdio)
-    |-- Hotel Agent       -> Tavily MCP server         (remote, streamable HTTP)
-    |-- Weather Agent     -> Weather MCP server        (local, stdio, written here)
+    |
+    |-- in parallel, one superstep:
+    |     |-- Flight Agent    -> AviationStack MCP server  (local, stdio)
+    |     |-- Hotel Agent     -> Tavily MCP server         (remote, streamable HTTP)
+    |     |-- Weather Agent   -> Weather MCP server        (local, stdio, written here)
+    |
     |-- Budget Agent      -> Groq LLM over the other agents' findings
     |-- Itinerary Agent   -> draft plan for review
     |-- Human Approval    -> interrupt(), waits for a person
@@ -94,11 +102,18 @@ PostgreSQL  (checkpoints: suspended runs and per-thread run history)
 | Server | Transport | Origin | Tools used |
 |---|---|---|---|
 | Tavily | Remote, streamable HTTP | Hosted by Tavily | `tavily_search` |
-| AviationStack | Local subprocess, stdio | [Pradumnasaraf/aviationstack-mcp](https://github.com/Pradumnasaraf/aviationstack-mcp) | `list_airports`, `list_airlines` |
+| AviationStack | Local subprocess, stdio | [Pradumnasaraf/aviationstack-mcp](https://github.com/Pradumnasaraf/aviationstack-mcp) | `flight_arrival_departure_schedule` |
 | Weather | Local subprocess, stdio | `weather_mcp_server.py` in this repo | `get_current_weather`, `get_forecast` |
 
 Tools are discovered at runtime, so adding a server changes no agent code. Run
 `python check_mcp_servers.py` to see every tool the system can currently reach.
+
+A note on AviationStack, because it shapes the flight agent. A free key reaches exactly
+one of its seventeen tools. The airport, airline and route directories all answer HTTP 200
+with `function_access_restricted`, so the flight agent is built on same-day arrival and
+departure schedules for both ends of the trip, and names only carriers it actually
+observed. `mcp_client.describe_api_error` translates that restriction into a readable note
+rather than letting the error JSON reach a prompt as though it were data.
 
 ---
 
@@ -126,8 +141,13 @@ Multi Agent System Demo/
 ├── api.py                    # FastAPI, two-phase planning endpoints
 ├── main.py                   # CLI entry point, same graph
 ├── check_mcp_servers.py      # MCP connectivity and tool discovery check
+├── pyproject.toml            # pytest, ruff and mypy configuration
 ├── tests/
-│   └── test_workflow.py      # end-to-end checks: guardrail, routing, HITL, checkpoints
+│   ├── test_logic.py         # pure logic: parsing, selection, clipping, redaction
+│   ├── test_routing.py       # the real graph over stub nodes: routing and approval
+│   ├── test_api.py           # endpoints against a stubbed graph
+│   └── test_integration.py   # live services, marked and excluded from CI
+├── .github/workflows/ci.yml  # lint, types and the offline suite on every push
 ├── frontend/
 │   └── src/
 │       ├── api/travel.ts             # the only module that calls the backend
@@ -149,7 +169,7 @@ Multi Agent System Demo/
 
 ### Prerequisites
 
-- Python 3.10 or newer for the app, and Python 3.13 or newer for the AviationStack MCP server
+- Python 3.11 or newer for the app, and Python 3.13 or newer for the AviationStack MCP server
 - Node.js 18 or newer
 - A running PostgreSQL instance
 - `uv` for installing the AviationStack server: `pip install uv`
@@ -279,6 +299,7 @@ than indexing.
 
 | Method | Path | Purpose |
 |---|---|---|
+| `POST` | `/api/plan/stream` | Same as below, streamed as NDJSON so the UI can show real per-agent progress. |
 | `POST` | `/api/plan` | Run the guardrail, supervisor, and selected specialists. Stops at approval. |
 | `POST` | `/api/approve` | Resume the suspended run with `approved` and `feedback`. |
 | `GET` | `/api/thread/{thread_id}` | Read a thread's latest checkpoint, including a pending draft. |
@@ -291,19 +312,39 @@ Interactive documentation is at <http://localhost:8000/docs>.
 ## Tests
 
 ```bash
-python tests/test_workflow.py
+pip install -r requirements-dev.txt
+
+pytest                      # everything except the live integration suite
+pytest -m integration       # the live suite: costs API calls, takes minutes
+ruff check .                # lint
+mypy                        # type check
 ```
 
-These are integration tests. They call Groq, the MCP servers, and PostgreSQL, and cover
-the behaviour that is easy to break:
+158 tests run with **no credentials, no network and no database**, in under two seconds.
+That is deliberate: the model and the connection pool are built on first use rather than
+at import, so `agents.py` and `graph.py` can be imported and the graph constructed with
+stub nodes. `build_graph(checkpointer, nodes=...)` swaps the node implementations, which
+is how the routing tests exercise the real edges and routing functions without a model.
 
-- the guardrail rejects off-topic and empty requests, and stops the graph rather than
-  letting it run on to the approval node
-- an empty request is rejected without spending a model call
-- a weather-only request routes to two agents and produces no flight output
-- a full trip request runs several specialists and suspends for approval
-- resuming with a rejection and feedback produces a plan that differs from the draft
-- the PostgreSQL checkpoint retains the thread after the run
+What the offline suite protects:
+
+- **Routing**, the project's central claim. A weather-only request must select two agents
+  and produce no flight output; a full trip must fan the three data agents out and
+  converge on budget exactly once. A regression that quietly reverted the graph to a
+  sequential chain would still return a plausible itinerary, so nothing else would catch
+  it.
+- **The guardrail** stopping the graph rather than letting a refused request reach the
+  approval node, and an empty request costing no model call.
+- **Interrupt and resume**, including that the draft lives in the interrupt payload before
+  the node returns, and that feedback reaches the final agent.
+- **Parsing** what the model returned: fenced code blocks, prose on both sides, unknown
+  agent names, non-list selections.
+- **Credential redaction**, with the Tavily key in a URL query string.
+- **The API guards**: the 409 on replanning a suspended thread, input bounds, and that
+  exception text never reaches the client.
+
+The integration suite is marked and excluded from CI, because it calls Groq, the MCP
+servers and PostgreSQL. It is the smaller half of the coverage by design.
 
 ---
 

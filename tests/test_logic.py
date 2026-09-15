@@ -444,7 +444,17 @@ def test_data_agents_are_the_parallel_prefix_of_agent_order():
     # drift apart, the fan-out would either miss an agent or schedule a
     # sequential one in parallel.
     assert AGENT_ORDER[: len(DATA_AGENTS)] == DATA_AGENTS
-    assert AGENT_ORDER[len(DATA_AGENTS) :] == ["budget_agent", "itinerary_agent"]
+    assert AGENT_ORDER[len(DATA_AGENTS) :] == [
+        "research_agent",
+        "budget_agent",
+        "itinerary_agent",
+    ]
+
+
+def test_research_agent_is_not_in_the_parallel_group():
+    # It loops, and a cyclic branch inside the fan-out makes the join node run
+    # twice. Verified against the installed LangGraph before the agent was added.
+    assert "research_agent" not in DATA_AGENTS
 
 
 def test_itinerary_agent_is_last():

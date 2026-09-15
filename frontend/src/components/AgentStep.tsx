@@ -17,6 +17,7 @@ import {
   Loader2,
   Map,
   Plane,
+  Search,
   Wallet,
 } from "lucide-react";
 
@@ -25,7 +26,7 @@ export type StepState = "waiting" | "running" | "complete" | "skipped";
 interface AgentStepProps {
   title: string;
   subtitle: string;
-  icon: "plane" | "hotel" | "cloud" | "wallet" | "map";
+  icon: "plane" | "hotel" | "cloud" | "search" | "wallet" | "map";
   content: string;
   state: StepState;
   isLast: boolean;
@@ -35,6 +36,7 @@ const ICONS: Record<AgentStepProps["icon"], ReactNode> = {
   plane: <Plane size={14} strokeWidth={2} />,
   hotel: <Hotel size={14} strokeWidth={2} />,
   cloud: <Map size={14} strokeWidth={2} />,
+  search: <Search size={14} strokeWidth={2} />,
   wallet: <Wallet size={14} strokeWidth={2} />,
   map: <FileText size={14} strokeWidth={2} />,
 };

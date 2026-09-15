@@ -21,6 +21,7 @@ const AGENT_LABELS: Record<AgentKey, string> = {
   flight_agent: "Flight",
   hotel_agent: "Hotel",
   weather_agent: "Weather",
+  research_agent: "Research",
   budget_agent: "Budget",
   itinerary_agent: "Itinerary",
 };
@@ -28,6 +29,7 @@ const AGENT_LABELS: Record<AgentKey, string> = {
 const CONSTRAINT_LABELS: [keyof TripConstraints, string][] = [
   ["origin", "From"],
   ["destination", "To"],
+  ["destination_iata", "Airport"],
   ["duration", "Duration"],
   ["budget", "Budget"],
   ["travel_style", "Style"],

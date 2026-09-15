@@ -12,16 +12,17 @@
 // to the developer's own machine.
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
-// A full trip request runs five agents and can take well over a minute, so the
+// A full trip request runs six agents and can take well over a minute, so the
 // timeout is generous. Without one, a hung backend leaves the UI spinning
 // forever with no way back.
 const REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_REQUEST_TIMEOUT_MS ?? 180_000);
 
-/** The five specialists the supervisor can schedule, in running order. */
+/** The specialists the supervisor can schedule, in running order. */
 export const AGENT_KEYS = [
   "flight_agent",
   "hotel_agent",
   "weather_agent",
+  "research_agent",
   "budget_agent",
   "itinerary_agent",
 ] as const;
@@ -31,6 +32,8 @@ export type AgentKey = (typeof AGENT_KEYS)[number];
 export interface TripConstraints {
   destination?: string;
   origin?: string;
+  destination_iata?: string;
+  origin_iata?: string;
   duration?: string;
   budget?: string;
   travel_style?: string;
@@ -54,6 +57,7 @@ export interface PlanResponse {
   flight_results: string;
   hotel_results: string;
   weather_results: string;
+  research_results: string;
   budget_results: string;
 
   /** Draft plan and the pending review. */

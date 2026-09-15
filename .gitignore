@@ -16,3 +16,6 @@ aviationstack-mcp/
 
 # Local run logs
 *.log
+
+# Personal notes, not part of the project
+notes.txt

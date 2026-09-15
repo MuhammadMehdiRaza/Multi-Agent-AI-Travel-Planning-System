@@ -15,21 +15,23 @@ import operator
 from typing import Annotated, Any, TypedDict
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END
 from langgraph.types import Command, interrupt
 
-from agents import DATA_AGENTS
+from agents import DATA_AGENTS, MAX_RESEARCH_STEPS
 from graph import (
     POST_DATA_ROUTES,
+    RESEARCH_ROUTES,
     SUPERVISOR_ROUTES,
     build_graph,
     route_after_data,
+    route_after_research,
     route_from_supervisor,
 )
 
-ALL_AGENTS = [*DATA_AGENTS, "budget_agent", "itinerary_agent"]
+ALL_AGENTS = [*DATA_AGENTS, "research_agent", "budget_agent", "itinerary_agent"]
 
 
 # -- The routing functions in isolation ---------------------------------------
@@ -117,6 +119,9 @@ class TrackedState(TypedDict, total=False):
     hotel_results: str
     weather_results: str
     budget_results: str
+    research_results: str
+    research_messages: Annotated[list, operator.add]
+    research_steps: Annotated[int, operator.add]
     itinerary: str
     approval_request: str
     approved: bool
@@ -128,7 +133,7 @@ class TrackedState(TypedDict, total=False):
 
 def _stub_nodes(plan: dict[str, Any], record: list[str]) -> dict:
     """
-    Stand-ins for the eight real nodes.
+    Stand-ins for the ten real nodes.
 
     The supervisor returns `plan` verbatim, so a test states the routing decision
     directly instead of hoping a model produces it. Every other node records that
@@ -177,11 +182,61 @@ def _stub_nodes(plan: dict[str, Any], record: list[str]) -> dict:
             "llm_calls": 1,
         }
 
+    def research(state):
+        """
+        Stands in for the tool-choosing agent.
+
+        `research_loops` in the plan says how many tool rounds to request. The
+        stub returns a message carrying tool_calls, which is exactly what
+        route_after_research inspects, so the real loop condition is exercised.
+        """
+        record.append("research_agent")
+        wanted = int(plan.get("research_loops", 0))
+        spent = state.get("research_steps", 0)
+
+        if spent < wanted:
+            message = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "tavily_search",
+                        "args": {"query": "visa rules"},
+                        "id": "call_" + str(spent),
+                        "type": "tool_call",
+                    }
+                ],
+            )
+            return {
+                "research_messages": [message],
+                "research_steps": 1,
+                "visited": ["research_agent"],
+                "llm_calls": 1,
+            }
+
+        return {
+            "research_messages": [AIMessage(content="findings")],
+            "research_steps": 1,
+            "research_results": "research findings",
+            "visited": ["research_agent"],
+            "llm_calls": 1,
+        }
+
+    def research_tools(_state):
+        record.append("research_tools")
+        return {
+            "research_messages": [
+                ToolMessage(content="tool output", tool_call_id="call_x", name="tavily_search")
+            ],
+            "visited": ["research_tools"],
+        }
+
     return {
         "supervisor": supervisor,
         "flight_agent": make("flight_agent", "flight_results"),
         "hotel_agent": make("hotel_agent", "hotel_results", calls=0),
         "weather_agent": make("weather_agent", "weather_results", calls=0),
+        "research_agent": research,
+        "research_tools": research_tools,
         "budget_agent": make("budget_agent", "budget_results"),
         "itinerary_agent": itinerary,
         "human_approval": approval,
@@ -325,8 +380,9 @@ class TestLlmCallAccounting:
         # A plain int here raises InvalidUpdateError the moment two parallel
         # branches write it, which is why state.llm_calls is a reducer.
         result, _, _, _ = run_plan({"selected_agents": ALL_AGENTS})
-        # supervisor 2 + flight 1 + hotel 0 + weather 0 + budget 1 + itinerary 1
-        assert result["llm_calls"] == 5
+        # supervisor 2 + flight 1 + hotel 0 + weather 0 + research 1 + budget 1
+        # + itinerary 1
+        assert result["llm_calls"] == 6
 
     def test_counter_reflects_the_narrower_route(self, run_plan):
         result, _, _, _ = run_plan({"selected_agents": ["weather_agent", "itinerary_agent"]})
@@ -338,6 +394,123 @@ class TestLlmCallAccounting:
         before = app.get_state(config).values["llm_calls"]
         result = app.invoke(Command(resume={"approved": True}), config=config)
         assert result["llm_calls"] == before + 1
+
+
+class TestRouteAfterResearch:
+    """The back edge that makes this the only cycle in the graph."""
+
+    @staticmethod
+    def _state(tool_calls: bool, steps: int, selected=None):
+        message = AIMessage(
+            content="",
+            tool_calls=(
+                [{"name": "tavily_search", "args": {}, "id": "c1", "type": "tool_call"}]
+                if tool_calls
+                else []
+            ),
+        )
+        return {
+            "research_messages": [message],
+            "research_steps": steps,
+            "selected_agents": selected if selected is not None else ALL_AGENTS,
+        }
+
+    def test_loops_when_a_tool_was_requested_and_budget_remains(self):
+        assert route_after_research(self._state(True, 0)) == "research_tools"
+
+    def test_leaves_when_no_tool_was_requested(self):
+        assert route_after_research(self._state(False, 1)) == "budget_agent"
+
+    def test_leaves_once_the_step_budget_is_spent(self):
+        # Without this the loop would run until the recursion limit.
+        state = self._state(True, MAX_RESEARCH_STEPS)
+        assert route_after_research(state) == "budget_agent"
+
+    def test_skips_budget_on_the_way_out_when_not_selected(self):
+        state = self._state(False, 1, selected=["research_agent", "itinerary_agent"])
+        assert route_after_research(state) == "itinerary_agent"
+
+    def test_empty_history_does_not_raise(self):
+        assert route_after_research({"selected_agents": ALL_AGENTS}) == "budget_agent"
+
+    def test_returns_only_declared_destinations(self):
+        for calls in (True, False):
+            for steps in (0, MAX_RESEARCH_STEPS):
+                assert route_after_research(self._state(calls, steps)) in RESEARCH_ROUTES
+
+
+class TestResearchLoop:
+    def test_no_tool_request_means_no_loop(self, run_plan):
+        _, visited, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 0}
+        )
+        assert visited.count("research_agent") == 1
+        assert "research_tools" not in visited
+
+    def test_one_tool_request_goes_round_once(self, run_plan):
+        _, visited, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 1}
+        )
+        assert visited.count("research_tools") == 1
+        assert visited.count("research_agent") == 2
+
+    def test_two_tool_requests_go_round_twice(self, run_plan):
+        _, visited, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 2}
+        )
+        assert visited.count("research_tools") == 2
+        assert visited.count("research_agent") == 3
+
+    def test_the_step_budget_stops_a_runaway_loop(self, run_plan):
+        # The stub asks for a tool every single pass. Only the budget can end it.
+        result, visited, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 99}
+        )
+        # MAX counts model passes and the last is reserved for the answer, so
+        # the agent gets one fewer round of tool calls than that.
+        assert visited.count("research_tools") == MAX_RESEARCH_STEPS - 1
+        assert result.get("__interrupt__"), "the run must still reach approval"
+
+    def test_loop_output_reaches_the_plan(self, run_plan):
+        result, _, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 1}
+        )
+        assert result["research_results"] == "research findings"
+
+    def test_tool_results_accumulate_in_the_private_scratchpad(self, run_plan):
+        result, _, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 2}
+        )
+        history = result["research_messages"]
+        tool_messages = [m for m in history if isinstance(m, ToolMessage)]
+
+        # The model must see what its earlier calls returned in order to decide
+        # what to do next, which is why this key accumulates.
+        assert len(tool_messages) == 2
+
+    def test_research_can_run_without_any_data_agent(self, run_plan):
+        _, visited, _, _ = run_plan(
+            {"selected_agents": ["research_agent", "itinerary_agent"], "research_loops": 1}
+        )
+        assert visited[:2] == ["supervisor", "research_agent"]
+        assert "flight_agent" not in visited
+
+    def test_research_is_skipped_when_not_selected(self, run_plan):
+        _, visited, _, _ = run_plan(
+            {"selected_agents": [*DATA_AGENTS, "itinerary_agent"]}
+        )
+        assert "research_agent" not in visited
+        assert "research_tools" not in visited
+
+    def test_research_runs_after_the_fan_out_joins(self, run_plan):
+        # Its branch length is unpredictable, so it must not be inside the
+        # fan-out: a cyclic branch there makes the join node run twice.
+        _, visited, _, _ = run_plan(
+            {"selected_agents": ALL_AGENTS, "research_loops": 1}
+        )
+        for agent in DATA_AGENTS:
+            assert visited.index(agent) < visited.index("research_agent")
+        assert visited.count("budget_agent") == 1
 
 
 def test_graph_compiles_without_a_checkpointer():
@@ -352,6 +525,8 @@ def test_graph_exposes_the_expected_nodes():
         "flight_agent",
         "hotel_agent",
         "weather_agent",
+        "research_agent",
+        "research_tools",
         "budget_agent",
         "itinerary_agent",
         "human_approval",

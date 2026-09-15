@@ -68,6 +68,7 @@ class PlanResponse(BaseModel):
     flight_results: str = ""
     hotel_results: str = ""
     weather_results: str = ""
+    research_results: str = ""
     budget_results: str = ""
 
     # Draft and human review
@@ -161,6 +162,7 @@ def _to_response(thread_id: str, state: dict) -> PlanResponse:
         flight_results=state.get("flight_results", ""),
         hotel_results=state.get("hotel_results", ""),
         weather_results=state.get("weather_results", ""),
+        research_results=state.get("research_results", ""),
         budget_results=state.get("budget_results", ""),
         itinerary=itinerary,
         approval_request=approval_request,

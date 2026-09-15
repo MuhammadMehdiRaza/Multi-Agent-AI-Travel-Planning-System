@@ -41,6 +41,18 @@ class TravelState(TypedDict, total=False):
     weather_results: str
     budget_results: str
 
+    # Research agent. Unlike every other specialist, this one chooses its own
+    # tool calls, so it needs a scratchpad of its own and a step budget.
+    #
+    # research_messages is the agent's private conversation: its own replies and
+    # the tool results it asked for. It accumulates, because the model has to see
+    # what previous calls returned in order to decide what to do next. It is kept
+    # separate from `messages` so the agent's intermediate reasoning does not end
+    # up in the user-facing transcript.
+    research_results: str
+    research_messages: Annotated[list[AnyMessage], operator.add]
+    research_steps: Annotated[int, operator.add]
+
     # Draft plan and human review
     itinerary: str
     approval_request: str

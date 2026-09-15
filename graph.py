@@ -43,12 +43,15 @@ from psycopg_pool import ConnectionPool
 
 from agents import (
     DATA_AGENTS,
+    MAX_RESEARCH_STEPS,
     budget_agent,
     final_response_agent,
     flight_agent,
     hotel_agent,
     human_approval_agent,
     itinerary_agent,
+    research_agent,
+    research_tools_agent,
     supervisor_agent,
     weather_agent,
 )
@@ -64,6 +67,8 @@ NODES = {
     "flight_agent": flight_agent,
     "hotel_agent": hotel_agent,
     "weather_agent": weather_agent,
+    "research_agent": research_agent,
+    "research_tools": research_tools_agent,
     "budget_agent": budget_agent,
     "itinerary_agent": itinerary_agent,
     "human_approval": human_approval_agent,
@@ -77,13 +82,23 @@ SUPERVISOR_ROUTES: dict[Hashable, str] = {
     "flight_agent": "flight_agent",
     "hotel_agent": "hotel_agent",
     "weather_agent": "weather_agent",
+    "research_agent": "research_agent",
     "budget_agent": "budget_agent",
     "itinerary_agent": "itinerary_agent",
     "blocked": END,
 }
 
-# Where a data specialist can go once it finishes.
+# Where a data specialist can go once the fan-out joins.
 POST_DATA_ROUTES: dict[Hashable, str] = {
+    "research_agent": "research_agent",
+    "budget_agent": "budget_agent",
+    "itinerary_agent": "itinerary_agent",
+}
+
+# The research agent's own exits. "research_tools" is the back edge that makes
+# this the one cycle in the graph.
+RESEARCH_ROUTES: dict[Hashable, str] = {
+    "research_tools": "research_tools",
     "budget_agent": "budget_agent",
     "itinerary_agent": "itinerary_agent",
 }
@@ -102,6 +117,7 @@ RETRY_NODES = {
     "flight_agent",
     "hotel_agent",
     "weather_agent",
+    "research_agent",
     "budget_agent",
     "itinerary_agent",
     "final_response",
@@ -112,6 +128,11 @@ RETRY_NODES = {
 
 def _selected(state: TravelState) -> list[str]:
     return list(state.get("selected_agents") or [])
+
+
+def _next_after_gathering(state: TravelState) -> str:
+    """The first non-gathering stage the supervisor selected."""
+    return "budget_agent" if "budget_agent" in _selected(state) else "itinerary_agent"
 
 
 def route_from_supervisor(state: TravelState) -> str | list[str]:
@@ -131,21 +152,49 @@ def route_from_supervisor(state: TravelState) -> str | list[str]:
     if parallel:
         return parallel
 
-    if "budget_agent" in selected:
-        return "budget_agent"
+    # No data agent selected, so fall through to the first later stage that was.
+    # research_agent has to be checked here too: without it a request needing
+    # only research skipped straight past the agent that would have answered it.
+    if "research_agent" in selected:
+        return "research_agent"
 
-    return "itinerary_agent"
+    return _next_after_gathering(state)
 
 
 def route_after_data(state: TravelState) -> str:
     """
     Where the data specialists converge.
 
-    All three return the same answer, so they meet at one node and LangGraph
-    runs it once. Budget has to come after them because it reasons over their
-    output; the itinerary node is the guaranteed terminus either way.
+    All three return the same answer, so they meet at one node and LangGraph runs
+    it once. The research agent comes next when selected, then budget, which
+    reasons over everything gathered. The itinerary node is the guaranteed
+    terminus either way.
     """
-    return "budget_agent" if "budget_agent" in _selected(state) else "itinerary_agent"
+    if "research_agent" in _selected(state):
+        return "research_agent"
+
+    return _next_after_gathering(state)
+
+
+def route_after_research(state: TravelState) -> str:
+    """
+    Close the research loop, or leave it.
+
+    The agent goes round again whenever it asked for a tool and has budget left.
+    The budget is also enforced inside the node, by invoking the model with no
+    tools bound on the final pass, so the loop cannot spin against the recursion
+    limit even if this check were wrong.
+    """
+    history = state.get("research_messages") or []
+    last = history[-1] if history else None
+
+    requested = getattr(last, "tool_calls", None) or []
+    spent = state.get("research_steps", 0)
+
+    if requested and spent < MAX_RESEARCH_STEPS:
+        return "research_tools"
+
+    return _next_after_gathering(state)
 
 
 # -- Assembly -----------------------------------------------------------------
@@ -173,6 +222,9 @@ def build_graph(checkpointer=None, nodes: dict | None = None):
 
     for name in DATA_AGENTS:
         graph.add_conditional_edges(name, route_after_data, POST_DATA_ROUTES)
+
+    graph.add_conditional_edges("research_agent", route_after_research, RESEARCH_ROUTES)
+    graph.add_edge("research_tools", "research_agent")
 
     graph.add_edge("budget_agent", "itinerary_agent")
     graph.add_edge("itinerary_agent", "human_approval")

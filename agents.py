@@ -1,16 +1,23 @@
 """
-agents.py - The eight nodes that make up the travel planning graph.
+agents.py - The ten nodes that make up the travel planning graph.
 
 Node roles:
 
   supervisor_agent       validates the request, then decides which specialists run
-  flight_agent           airport and airline data from the AviationStack MCP server
+  flight_agent           live schedules from the AviationStack MCP server
   hotel_agent            accommodation search through the Tavily MCP server
   weather_agent          current conditions and forecast from the weather MCP server
+  research_agent         picks its own tools and loops until it can answer
+  research_tools_agent   runs whatever the research agent asked for
   budget_agent           feasibility and cost assessment over the other agents' output
   itinerary_agent        assembles a draft plan and the human approval request
   human_approval_agent   suspends the graph and waits for a real person
   final_response_agent   produces the final plan, honouring any human feedback
+
+Only research_agent chooses its own tools. The other specialists call a fixed tool
+from a fixed position, which is deliberate: their inputs are known in advance, so a
+structured call is more predictable and cheaper than an agent loop. The research
+agent handles the questions where the right tool cannot be known up front.
 
 Two design rules hold throughout:
 
@@ -27,17 +34,19 @@ import json
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 
 from config import get_llm
 from mcp_client import (
     ToolUnavailable,
+    call_tool,
     current_weather,
     flatten_content,
     flight_schedule,
     forecast,
     format_search_results,
+    get_tools,
     redact,
     run_sync,
     summarise_schedule,
@@ -74,10 +83,34 @@ DATA_AGENTS = [
 # Every specialist the supervisor may schedule, in dependency order. Budget
 # reasons over the data agents' output and the itinerary reasons over everything,
 # so those two stay sequential and come last.
+# research_agent is deliberately NOT in DATA_AGENTS even though it also only
+# gathers information. It loops, so its branch length is unpredictable, and a
+# cyclic branch inside the fan-out breaks the join: measured against the
+# installed version, the convergence node ran twice, once when the fast branches
+# finished and again when the loop did. It therefore runs sequentially, after the
+# fan-out has joined.
 AGENT_ORDER = DATA_AGENTS + [
+    "research_agent",
     "budget_agent",
     "itinerary_agent",
 ]
+
+# How many model passes the research agent gets. The last one summarises what the
+# tools returned, so the agent gets MAX_RESEARCH_STEPS - 1 rounds of tool calls
+# and the loop cannot run to the recursion limit.
+MAX_RESEARCH_STEPS = 3
+
+# The research agent gets a curated slice of the discovered tools rather than all
+# seventeen. Two reasons: every tool's JSON schema goes into the prompt on every
+# pass, and the unrelated ones, such as random aircraft metadata, invite calls
+# that cannot help a traveller.
+RESEARCH_TOOL_PREFIXES = ("tavily_",)
+RESEARCH_TOOL_NAMES = {
+    "get_current_weather",
+    "get_forecast",
+    "random_cities_detailed_info",
+    "random_countries_detailed_info",
+}
 
 # Prompt size budget.
 #
@@ -227,12 +260,16 @@ Available agents:
 - flight_agent: flights, airports, airlines, routes, or airfare guidance
 - hotel_agent: hotels, stays, neighbourhoods, or accommodation
 - weather_agent: weather, climate, season, packing, or forecast
+- research_agent: open questions where the answer is not in the other agents'
+  data, such as visa rules, safety, local customs, or events during the dates.
+  This one picks its own tools, so use it when you cannot say in advance what
+  needs looking up.
 - budget_agent: budget, affordability, cost, or price constraints
 - itinerary_agent: always needed, it produces the plan the user reads
 
 Return only JSON with this schema:
 {{
-  "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"],
+  "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "research_agent", "budget_agent", "itinerary_agent"],
   "trip_constraints": {{
     "destination": "",
     "origin": "",
@@ -503,7 +540,225 @@ def weather_agent(state: TravelState) -> dict[str, Any]:
     }
 
 
-# -- 5. Budget specialist -----------------------------------------------------
+# -- 5. Research specialist, the one agent that chooses its own tools ---------
+
+RESEARCH_SYSTEM = """
+You are a travel research specialist with access to search and weather tools.
+
+Answer the open questions about this trip that the other specialists cannot: entry
+and visa requirements, safety advisories, local customs worth knowing, and events
+falling in the travel window.
+
+Work in steps. Call a tool when you need something you do not know, read what it
+returns, then decide whether to call another or to answer. Prefer a targeted
+search over a broad one. Stop as soon as you can answer, and do not call a tool
+twice for the same thing.
+
+When you are ready, reply with your findings as short labelled sections. Say
+explicitly which claims came from a tool and which are your own knowledge, and
+say so plainly when you could not establish something.
+""" + UNTRUSTED_RULES
+
+
+def _research_toolset() -> list[Any]:
+    """The slice of discovered MCP tools this agent may choose from."""
+    try:
+        discovered = run_sync(get_tools())
+    except Exception as exc:
+        log.warning("Tool discovery failed for the research agent: %s", redact(exc))
+        return []
+
+    return [
+        tool
+        for tool in discovered
+        if tool.name.startswith(RESEARCH_TOOL_PREFIXES) or tool.name in RESEARCH_TOOL_NAMES
+    ]
+
+
+RESEARCH_SUMMARY_SYSTEM = """
+You are a travel research specialist writing up findings someone else gathered.
+""" + UNTRUSTED_RULES
+
+RESEARCH_SUMMARY_PROMPT = """
+Write up the research findings for this trip from the material below.
+
+Trip request:
+{query}
+
+Trip constraints:
+{constraints}
+
+Material gathered by the search tools:
+{gathered}
+
+Cover entry and visa requirements, safety, local customs and any events in the
+travel window, but only where the material supports it. Use short labelled
+sections. State plainly which points come from the material and which are your
+own knowledge, and say when something could not be established.
+"""
+
+
+def _summarise_research(state: TravelState, history: list[Any]) -> dict[str, Any]:
+    """
+    Turn the collected tool output into findings, in one clean call.
+
+    Separate from the agent loop on purpose. See the note in research_agent about
+    why continuing a tool-use conversation without tools fails on Groq.
+    """
+    gathered = [
+        str(message.content)
+        for message in history
+        if isinstance(message, ToolMessage) and message.content
+    ]
+
+    if not gathered:
+        message = "[The research agent gathered no usable material.]"
+        return {
+            "research_results": message,
+            "research_steps": 1,
+            "messages": [AIMessage(content="Research agent finished with no findings.")],
+        }
+
+    result = _llm_text(
+        RESEARCH_SUMMARY_SYSTEM,
+        RESEARCH_SUMMARY_PROMPT.format(
+            query=state.get("user_query", ""),
+            constraints=state.get("trip_constraints") or {},
+            gathered=_clip("\n\n".join(gathered), MAX_ITINERARY_CHARS),
+        ),
+    )
+
+    return {
+        "research_results": result or "No findings were produced.",
+        "research_steps": 1,
+        "llm_calls": 1,
+        "messages": [
+            AIMessage(
+                content="Research agent completed after "
+                + str(len(gathered))
+                + " tool call(s)."
+            )
+        ],
+    }
+
+
+def research_agent(state: TravelState) -> dict[str, Any]:
+    """
+    The only genuinely agentic node in the graph.
+
+    Every other specialist calls a fixed tool from a fixed position. This one is
+    handed the discovered toolset, decides for itself which tools to call and in
+    what order, reads the results, and keeps going until it can answer. That loop
+    is the cycle in the graph: this node routes to research_tools whenever it
+    asks for something, and research_tools routes straight back.
+
+    It is also the only thing that makes runtime tool discovery pay for itself.
+    Elsewhere the tools are bound into hand-written wrappers, so adding an MCP
+    server changes no agent code and no agent calls it either. Here a newly
+    discovered tool becomes available to the model immediately.
+    """
+    toolset = _research_toolset()
+
+    if not toolset:
+        message = "[No research tools are available, so this section was skipped.]"
+        return {
+            "research_results": message,
+            "messages": [AIMessage(content="Research agent skipped: no tools available.")],
+        }
+
+    history = list(state.get("research_messages") or [])
+    spent = state.get("research_steps", 0)
+
+    # Final pass: stop gathering and write up what the tools returned.
+    #
+    # The obvious way to end the loop, invoking the same conversation with no
+    # tools bound, does not work on Groq. It sends tool_choice: "none", the model
+    # sees a conversation mid-tool-use and tries to call a tool anyway, and the
+    # API rejects the request with "Tool choice is none, but model called a
+    # tool". The retry policy then burns three attempts on a request that can
+    # never succeed and the section comes back empty.
+    #
+    # Summarising in a separate call sidesteps it: the prompt is built fresh from
+    # the collected tool output, so there is no tool-call history to continue and
+    # nothing for the model to try to extend. It also guarantees the gathered
+    # data is used even when the agent would have kept going.
+    if history and spent >= MAX_RESEARCH_STEPS - 1:
+        return _summarise_research(state, history)
+
+    if history:
+        conversation = history
+        fresh: list[Any] = []
+    else:
+        constraints = state.get("trip_constraints") or {}
+        conversation = [
+            SystemMessage(content=RESEARCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    "Trip request:\n"
+                    + str(state.get("user_query", ""))
+                    + "\n\nWhat the supervisor extracted:\n"
+                    + str(constraints)
+                )
+            ),
+        ]
+        fresh = list(conversation)
+
+    response = _get_llm().bind_tools(toolset).invoke(conversation)
+    fresh.append(response)
+
+    update: dict[str, Any] = {
+        "research_messages": fresh,
+        "research_steps": 1,
+        "llm_calls": 1,
+    }
+
+    requested = getattr(response, "tool_calls", None) or []
+
+    if requested:
+        names = ", ".join(str(call.get("name")) for call in requested)
+        log.info("Research agent requested: %s", names)
+        update["messages"] = [AIMessage(content="Research agent is calling: " + names)]
+    else:
+        update["research_results"] = response.text or "No findings were produced."
+        update["messages"] = [AIMessage(content="Research agent completed.")]
+
+    return update
+
+
+def research_tools_agent(state: TravelState) -> dict[str, Any]:
+    """
+    Execute whatever the research agent asked for, then hand control back.
+
+    Each result returns as a ToolMessage carrying the originating call id, which
+    is what lets the model match an answer to its own request. Results are fenced
+    for the same reason the other agents' output is: this is third-party content
+    arriving in a prompt, and a tool the model chose is no more trustworthy than
+    one we chose for it.
+    """
+    history = list(state.get("research_messages") or [])
+    last = history[-1] if history else None
+    requested = getattr(last, "tool_calls", None) or []
+
+    results: list[Any] = []
+
+    for call in requested:
+        name = str(call.get("name", ""))
+        arguments = call.get("args") or {}
+
+        text = _mcp_text(call_tool(name, arguments), "Tool " + name)
+
+        results.append(
+            ToolMessage(
+                content=_fence("TOOL RESULT " + name, text),
+                tool_call_id=str(call.get("id", "")),
+                name=name,
+            )
+        )
+
+    return {"research_messages": results}
+
+
+# -- 6. Budget specialist -----------------------------------------------------
 
 BUDGET_PROMPT = """
 Assess whether this trip is realistic for the user's budget.
@@ -523,6 +778,9 @@ Hotel options:
 Weather outlook:
 {weather}
 
+Research findings:
+{research}
+
 Give a concise assessment covering estimated cost categories, the main financial
 risks, concrete ways to save money, and a clear verdict on whether the plan is
 feasible as described. Where a section above is empty or unavailable, say what
@@ -539,6 +797,7 @@ def budget_agent(state: TravelState) -> dict[str, Any]:
             flights=_fence("FLIGHT DATA", state.get("flight_results") or "not gathered"),
             hotels=_fence("WEB SEARCH RESULTS", state.get("hotel_results") or "not gathered"),
             weather=_fence("WEATHER DATA", state.get("weather_results") or "not gathered"),
+            research=_fence("RESEARCH FINDINGS", state.get("research_results") or "not gathered"),
         ),
     )
 
@@ -549,7 +808,7 @@ def budget_agent(state: TravelState) -> dict[str, Any]:
     }
 
 
-# -- 6. Itinerary specialist --------------------------------------------------
+# -- 7. Itinerary specialist --------------------------------------------------
 
 ITINERARY_PROMPT = """
 Write a clear draft travel itinerary for human review.
@@ -569,6 +828,9 @@ Hotel options:
 Weather outlook:
 {weather}
 
+Research findings:
+{research}
+
 Budget assessment:
 {budget}
 
@@ -586,6 +848,7 @@ def itinerary_agent(state: TravelState) -> dict[str, Any]:
             flights=_fence("FLIGHT DATA", state.get("flight_results") or "not gathered"),
             hotels=_fence("WEB SEARCH RESULTS", state.get("hotel_results") or "not gathered"),
             weather=_fence("WEATHER DATA", state.get("weather_results") or "not gathered"),
+            research=_fence("RESEARCH FINDINGS", state.get("research_results") or "not gathered"),
             budget=_clip(state.get("budget_results") or "not gathered"),
         ),
     )
@@ -603,7 +866,7 @@ def itinerary_agent(state: TravelState) -> dict[str, Any]:
     }
 
 
-# -- 7. Human-in-the-loop gate ------------------------------------------------
+# -- 8. Human-in-the-loop gate ------------------------------------------------
 
 def human_approval_agent(state: TravelState) -> dict[str, Any]:
     """
@@ -662,7 +925,7 @@ def _read_human_response(response: Any) -> tuple[bool, str]:
     return approved, "" if approved else text
 
 
-# -- 8. Final response --------------------------------------------------------
+# -- 9. Final response --------------------------------------------------------
 
 APPROVED_PROMPT = """
 The reviewer approved this draft itinerary. Produce the final, polished travel

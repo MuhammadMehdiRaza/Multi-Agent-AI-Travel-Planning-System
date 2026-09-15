@@ -32,7 +32,7 @@ const PIPELINE: {
   key: AgentKey;
   title: string;
   subtitle: string;
-  icon: "plane" | "hotel" | "cloud" | "wallet" | "map";
+  icon: "plane" | "hotel" | "cloud" | "search" | "wallet" | "map";
   field: keyof PlanResponse;
 }[] = [
   {
@@ -55,6 +55,13 @@ const PIPELINE: {
     subtitle: "Conditions and forecast via the weather MCP server",
     icon: "cloud",
     field: "weather_results",
+  },
+  {
+    key: "research_agent",
+    title: "Research Agent",
+    subtitle: "Chooses its own tools and loops until it can answer",
+    icon: "search",
+    field: "research_results",
   },
   {
     key: "budget_agent",

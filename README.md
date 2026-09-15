@@ -19,11 +19,47 @@ that asks the same question: given the supervisor's plan, which agent runs next?
 | Request | Agents that run |
 |---|---|
 | `What is the weather in Tokyo?` | weather, itinerary |
+| `Do I need a visa for Japan and is it safe?` | research, itinerary |
 | `Plan 4 days in Dubai from Karachi, budget 150000 PKR` | flight, hotel, budget, itinerary |
 | `Write me a linked list in Python` | none, the guardrail stops it |
 
 The guardrail exits straight to the end of the graph, so a rejected request costs one
 model call instead of five agents' worth of paid API requests.
+
+### One agent chooses its own tools, the rest do not
+
+That distinction is deliberate, so it is worth stating plainly rather than leaving
+someone to discover it.
+
+Flight, hotel and weather call a fixed tool from a fixed position. Their inputs are
+known in advance, so a structured call is cheaper and more predictable than an
+agent loop, and the transitions around them can be tested exhaustively.
+
+`research_agent` is different. It handles the questions where the right tool cannot
+be known up front, such as visa rules, safety advisories or events in the travel
+window. It is handed the discovered toolset, decides for itself what to call, reads
+the results and keeps going. The `research_agent <-> research_tools` pair is the
+only cycle in the graph.
+
+A real run, asking about visa requirements and safety for a Pakistani citizen
+visiting Tokyo: the agent searched for visa requirements, read the result, then
+chose a *different* follow-up query about safety advisories, then wrote up its
+findings labelling which claims came from the tools and which from its own
+knowledge. Three model passes, two tool calls, none of it scripted.
+
+This is also the only thing that makes runtime tool discovery pay for itself.
+Everywhere else the tools sit behind hand-written wrappers, so a newly added MCP
+server changes no agent code and no agent calls it either. Here it becomes
+available to the model immediately.
+
+Two bounds keep the loop honest. It gets `MAX_RESEARCH_STEPS` model passes, and
+the last one is a summarisation rather than another tool round, so it cannot spin
+against the recursion limit. And the write-up happens in a *separate* call built
+from the collected tool output, not by continuing the tool conversation with the
+tools removed: Groq rejects that with "Tool choice is none, but model called a
+tool", which cost three wasted retries and an empty section before it was found.
+
+### The data specialists run in parallel
 
 The three data-gathering specialists run **in parallel**. Flight, hotel and weather read
 only the request and the supervisor's constraints, so they are independent and the
@@ -33,6 +69,12 @@ rather than once per branch. This is why `llm_calls` in `state.py` is an
 `Annotated[int, operator.add]` reducer: two parallel nodes writing a plain key in the same
 superstep raises `InvalidUpdateError`.
 
+`research_agent` is kept out of that group even though it also only gathers. Its
+branch length is unpredictable because it loops, and a cyclic branch inside the
+fan-out breaks the join: measured against the installed version, the convergence
+node ran twice, once when the fast branches finished and again when the loop did.
+It therefore runs after the fan-out has joined.
+
 ```mermaid
 graph TD;
 	__start__([__start__]):::first
@@ -40,6 +82,8 @@ graph TD;
 	flight_agent(flight_agent)
 	hotel_agent(hotel_agent)
 	weather_agent(weather_agent)
+	research_agent(research_agent)
+	research_tools(research_tools)
 	budget_agent(budget_agent)
 	itinerary_agent(itinerary_agent)
 	human_approval(human_approval)
@@ -50,14 +94,19 @@ graph TD;
 	supervisor -.-> flight_agent;
 	supervisor -.-> hotel_agent;
 	supervisor -.-> weather_agent;
+	supervisor -.-> research_agent;
 	supervisor -.-> budget_agent;
 	supervisor -.-> itinerary_agent;
+	flight_agent -.-> research_agent;
+	hotel_agent -.-> research_agent;
+	weather_agent -.-> research_agent;
 	flight_agent -.-> budget_agent;
-	flight_agent -.-> itinerary_agent;
 	hotel_agent -.-> budget_agent;
-	hotel_agent -.-> itinerary_agent;
 	weather_agent -.-> budget_agent;
-	weather_agent -.-> itinerary_agent;
+	research_agent -.-> research_tools;
+	research_tools --> research_agent;
+	research_agent -.-> budget_agent;
+	research_agent -.-> itinerary_agent;
 	budget_agent --> itinerary_agent;
 	itinerary_agent --> human_approval;
 	human_approval --> final_response;
@@ -89,6 +138,7 @@ LangGraph  (graph.py -> agents.py -> state.py)
     |     |-- Hotel Agent     -> Tavily MCP server         (remote, streamable HTTP)
     |     |-- Weather Agent   -> Weather MCP server        (local, stdio, written here)
     |
+    |-- Research Agent    -> picks its own tools, loops via research_tools
     |-- Budget Agent      -> Groq LLM over the other agents' findings
     |-- Itinerary Agent   -> draft plan for review
     |-- Human Approval    -> interrupt(), waits for a person
@@ -135,7 +185,7 @@ Multi Agent System Demo/
 ├── config.py                 # env, model factory, MCP server locations
 ├── state.py                  # TravelState, the shared object every node reads
 ├── mcp_client.py             # one MCP client over three servers, plus tool wrappers
-├── agents.py                 # the eight graph nodes
+├── agents.py                 # the ten graph nodes
 ├── graph.py                  # nodes, conditional edges, PostgreSQL checkpointer
 ├── weather_mcp_server.py     # custom MCP server for OpenWeatherMap
 ├── api.py                    # FastAPI, two-phase planning endpoints

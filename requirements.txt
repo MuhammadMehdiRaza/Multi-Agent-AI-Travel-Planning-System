@@ -1,26 +1,37 @@
+# Pinned to the versions this project was developed and tested against.
+#
+# Pins rather than ranges because the code depends on behaviour that moves
+# across releases: langgraph.types.interrupt, the __interrupt__ result key,
+# StateSnapshot.interrupts, list-returning conditional edges for fan-out, and
+# langchain-mcp-adapters' session-per-call semantics. An unpinned clone six
+# months from now has a real chance of breaking in ways that are hard to
+# attribute.
+
 # Agent orchestration
-langgraph
-langgraph-checkpoint-postgres
-langchain-core
+langgraph==1.2.11
+langgraph-checkpoint-postgres==3.1.2
+langchain-core==1.6.0
 
 # LLM provider
-langchain-groq
+langchain-groq==1.1.3
 
 # Model Context Protocol: client adapters for LangGraph, plus the server SDK
 # used by weather_mcp_server.py
-langchain-mcp-adapters
-mcp
+langchain-mcp-adapters==0.3.2
+mcp==1.29.1
 
-# PostgreSQL, for checkpoints and conversation memory. The pool is required
+# PostgreSQL, for checkpoints and human-in-the-loop resume. The pool is required
 # because FastAPI serves requests from multiple threads.
-psycopg[binary,pool]
+psycopg==3.3.4
+psycopg-binary==3.3.4
+psycopg-pool==3.3.1
 
 # Backend API
-fastapi
-uvicorn
-pydantic
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.4
 
 # Direct HTTP, used only inside the custom weather MCP server
-requests
+requests==2.34.2
 
-python-dotenv
+python-dotenv==1.2.3
